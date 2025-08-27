@@ -1,0 +1,96 @@
+#==============================================================================#
+#                 Data prep for the 4 selected market return series            #
+#                                                                              #
+# Quick Summary:                                                               #
+# Under Basel III, market risk exposure is mapped to four asset classes:       #
+# equity, fixed income, foreign exchange, and commodity.                       #
+# For comprehensiveness, for each class above, I select a proxy covering the   # 
+# turbulent periods: 2008–2009 global financial crisis and 2015–2016 Chinese   # 
+# market crash to perform risk estimation. Specifically,                       #
+# 1. for equity, use daily closing prices of the Shanghai Composite Index      #
+#    (000001);                                                                 #
+# 2. for fixed income, use daily closing prices of the ChinaBond New Composite # 
+#    Index (CBA00101);                                                         #
+# 3. for foreign exchange, I use daily ratios of RMB to the US dollar          #
+#    (RMB/USD);                                                                #
+# 4. for commodity, I use daily closing physical price of Au99.99 traded on    #
+#    the Shanghai Gold Exchange.                                               #
+#                                                                              #
+# Claim:                                                                       #
+# All the datasets are downloaded from Wind and Yahoo Finance                  #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+setwd("C:/Users/1/OneDrive/桌面/portfolio")
+library(qrmtools)
+library(zoo)
+#==============================================================================#
+#                           Load downloaded csv files                          #
+#==============================================================================#
+SSE.df = read.csv(file="C:/Users/1/OneDrive/桌面/portfolio/SSE_Index.csv")
+SSE.df$time = as.Date(SSE.df$time)
+
+AU99.df = read.csv(file="C:/Users/1/OneDrive/桌面/portfolio/AU9999.csv")
+AU99.df$date = as.Date(AU99.df$date)
+
+CBA.df = read.csv(file="C:/Users/1/OneDrive/桌面/portfolio/CBA00101.csv")
+CBA.df = CBA.df[(order(as.Date(CBA.df$date),decreasing = F)),]
+CBA.df$date = as.Date(CBA$date)
+
+RMB_USD = get_data("CNYUSD=X",from="2002-01-01",to="2022-12-31",src="yahoo")
+RMB_USD = data.frame(date=index(RMB_USD)[which(is.na(RMB_USD)==F)],
+                     rate=RMB_USD[which(is.na(RMB_USD)==F)])
+
+#==============================================================================#
+#                                Select period:                                #
+# SSE: from 2002 to the end of 2022                                            #                                                                  
+# AU99: from 2004 to the end of 2022 (this one was published later than others)#
+# CBA: from 2002 to the end of 2022                                            #
+# RMB_USD: from 2002 to the end of 2022                                        #
+#==============================================================================#
+SSE = SSE.df[which(SSE.df$time >= as.Date('2002-01-01') & 
+                   SSE.df$time <= as.Date('2023-01-01')),]
+
+AU99 = AU99.df[which(AU99.df$date <= as.Date('2023-01-01')),]
+
+CBA = CBA.df[which(CBA.df$date >= as.Date('2002-01-01') & 
+                   CBA.df$date <= as.Date('2023-01-01')),]
+
+#==============================================================================#
+#                    Transform into log percentage returns                     #
+#==============================================================================#
+SSE.ret = data.frame(date=SSE$time[-1],
+                     return=log(SSE$close[-1]/SSE$close[-5095])*100)
+
+AU99.ret = data.frame(date=AU99$date[-1],
+                      return=log(AU99$price[-1]/AU99$price[-4626])*100)
+
+CBA.ret = data.frame(date=CBA$date[-1],
+                     return=log(CBA$closing[-1]/CBA$closing[-5255])*100) 
+
+RMBUSD.ret = data.frame(date=RMB_USD$date[-1],
+                        return=log(RMB_USD$CNYUSD.X[-1]/RMB_USD$CNYUSD.X[-5283])*100)
+
+#==============================================================================#
+#                               Save data files                                #
+#==============================================================================#
+save(SSE.ret,file = "SSE_return100.Rdata")
+save(AU99.ret,file = "AU99_return100.Rdata")
+save(CBA.ret,file = "CBA_return100.Rdata")
+save(RMBUSD.ret, file = "RMBUSD_return100.Rdata")
+
+#==============================================================================#
+#                     Summary Statistics for market indices                    #
+#==============================================================================#
+kurtosis(SSE.ret$return); skewness(SSE.ret$return)
+length(SSE.ret$date); SSE.ret$date[1]; tail(SSE.ret$date,1)
+
+kurtosis(AU99.ret$return); skewness(AU99.ret$return)
+length(AU99.ret$date); AU99.ret$date[1]; tail(AU99.ret$date,1)
+
+kurtosis(CBA.ret$return); skewness(CBA.ret$return)
+length(CBA.ret$date); CBA.ret$date[1]; tail(CBA.ret$date,1)
+
+kurtosis(RMBUSD.ret$return); skewness(RMBUSD.ret$return)
+length(RMBUSD.ret$date); RMBUSD.ret$date[1]; tail(RMBUSD.ret$date,1)
