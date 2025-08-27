@@ -1,0 +1,532 @@
+#==============================================================================#
+#             Forecasting VaR and ES by Gaussian Mixture Model (GMM)           #
+#     with Monte Carlo (MC) and Randomized Quasi-Monte Carlo (RQMC) sampling   #
+#                                                                              #
+# Quick Summary:                                                               #
+# Motivated by the nice backtest performance of VaR for a portfolio of US      # 
+# stocks in Seyfi et al. (2021), I attempt to apply their method on 4          #
+# portfolios of 22 representative China A-share stocks from Aug 28, 2001 to    # 
+# Dec 31, 2021 to make daily ES and VaR forecasts with a moving window of 250  # 
+# days.                                                                        #
+# Since Dec 26, 1996, the Chinese regulator started to impose a limit of ±10%  # 
+# for daily price change on both Shanghai stock exchange and Shenzhen stock    #
+# exchange, with exemption on the following date: (1) the IPO date; (2) the    # 
+# first trading date after the stock split-structure reform; (3) the first     #
+# trading date after seasonal offerings; (4) The first trading date after      #
+# material assets restructuring; (5) The first re-listing date of de-listed    # 
+# stocks. Consequently, simulation for Chinese stocks must be consistent with  # 
+# the price-limit mechanism. I only impose an upper truncation of log(1.1)     #
+# upon sampling for the sake of conservativeness.                              #
+# Unexpectedly, I failed to repilcate "good" forecasts on my dataset, as My ES # 
+# forecasts for all portfolios are rejected with strong evidence in 300 days   #
+# on average since backtest. Therefore, I didn't include the result in the     #
+# general e-backtesing file.                                                   #
+#                                                                              #
+# Reference:                                                                   #
+# Forecast method used here is proposed in the following paper:                #
+# [S. M. S. Seyfi, A. Sharifi, and H. Arian. Portfolio Value-at-Risk and       #
+# expected shortfall using an efficient simulation approach based on Gaussian  # 
+# Mixture Model. Mathematics and Computers in Simulation, 190:1056–1079, 2021.]#
+#                                                                              #
+# Note:                                                                        #
+# The way I adjust return estimates is different from their application.       #
+#                                                                              #
+# Claim:                                                                       #
+# To the best of my knowledge, their code are not published, and the following # 
+# code is written based on my understanding of their paper.                    #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+setwd("C:/Users/1/OneDrive/桌面/portfolio")
+library(ClusterR)
+library(MASS)
+library(rlist)
+library(mvtnorm)
+library(qrng)
+library(Matrix)
+library(matrixcalc)
+library(dplyr)
+library(rugarch)
+library(fGarch)
+
+#==============================================================================#
+#                                 Data Prep                                    #
+#==============================================================================#
+portfolio <- read.csv("CHportfolio.csv")
+portfolio$Date <- as.Date(portfolio$Date) #transform char to date
+GZMT <- as.numeric(portfolio$X600519)
+WLY <- as.numeric(portfolio$X000858)
+JDF <- as.numeric(portfolio$X000725)
+SAGD <- as.numeric(portfolio$X600703)
+GTDL <- as.numeric(portfolio$X600886)
+GDDL <- as.numeric(portfolio$X600795)
+HRYY <- as.numeric(portfolio$X600276)
+YNBY <- as.numeric(portfolio$X000538)
+WHHX <- as.numeric(portfolio$X600309)
+BGGF <- as.numeric(portfolio$X600019)
+GL <- as.numeric(portfolio$X000651)
+SQ <- as.numeric(portfolio$X600104)
+ZHSF <- as.numeric(portfolio$X600760)
+ZGCB <- as.numeric(portfolio$X600150)
+WK <- as.numeric(portfolio$X000002)
+LDKG <- as.numeric(portfolio$X600606)
+ZGSH <- as.numeric(portfolio$X600028)
+HLSH <- as.numeric(portfolio$X600346)
+WTKJ <- as.numeric(portfolio$X600745)
+ZXTX <- as.numeric(portfolio$X000063)
+PAYH <- as.numeric(portfolio$X000001)
+PFYH <- as.numeric(portfolio$X600000)
+P = cbind(GZMT, WLY, JDF, SAGD, GTDL, GDDL, HRYY, YNBY, WHHX, BGGF, GL,
+          SQ, ZHSF, ZGCB, WK, LDKG, ZGSH, HLSH, WTKJ, ZXTX, PAYH, PFYH) #matrix
+P_hat = matrix(NA,(nrow(P)-1),ncol(P))
+for (i in 2:nrow(P)) {P_hat[(i-1),]=P[i,]/P[(i-1),]}
+P_hat = -log(P_hat)*100 #negated percentage log returns
+P_hat_df = data.frame(date=portfolio$Date[-1],P_hat)
+
+#==============================================================================#
+#                          EM Algorithm to train GMM                           #
+# Note:                                                                        #
+# Use a moving window of size 250 days;                                        #
+# Input: data is a matrix (T by n) of stock log returns,                       # 
+#        where n=22 is the number of stocks,                                   #
+#        T=4688 the observation window, referring to 2002-09-12 to 2021-12-31; #
+#        cluster is the number of components, set to be 4 by BIC.              #
+# Each time, the initial is set by k-means algorithm.                          #
+#==============================================================================#
+GMM_EM_Model <- function(data, cluster) {
+  group = list()
+  Mu = list()
+  Cov = list()
+  W = matrix(NA,4688,cluster)
+  for (i in 1:4688) {
+    df = data[i:(i+249),]
+    df.s = NULL
+    for (j in 1:22) {
+      df.j = df[,j]
+      limit = sort(df.j,decreasing = T)[75]
+      df.s = cbind(df.s, df.j[which(df.j>=limit)])
+    }
+    k = cluster
+    model = GMM(df.s, k, km_iter = 20, em_iter = 50, 
+                full_covariance_matrices = T) #run EM Algorithm
+    group[[i]] = as.numeric(predict_GMM(df.s, 
+                                        model$centroids,
+                                        GMM(df.s, k, km_iter = 20, em_iter = 50)
+                                        $covariance_matrices,
+                                        model$weights)
+                             $cluster_labels)
+    Mu[[i]] = model$centroids #mean vector for each moving window data
+    Cov[[i]] = model$covariance_matrices #sigma for each moving window data
+    W[i,] = model$weights
+    print(i)
+  }
+  return(list(Mu=Mu, Sig=Cov, group=group, Weight=W))
+}
+
+GMM_model = GMM_EM_Model(P_hat, 4) 
+model.w = GMM_model[[4]] 
+
+par(mfrow=c(2,1))
+Optimal_Clusters_GMM(P_hat, max_clusters = 10, criterion = "BIC",
+                     km_iter = 20, em_iter = 50,
+                     plot_data = T) #BIC plot
+Optimal_Clusters_GMM(P_hat, max_clusters = 10, criterion = "AIC",
+                     km_iter = 20, em_iter = 50,
+                     plot_data = T) #BIC plot
+
+#==============================================================================#
+#                         Run MC to simulate m paths                           #
+# Input: m is the number of path to simulate,                                  #
+#        s is the number of discretization of 1                                #
+#==============================================================================#
+MC <- function(m,s) {
+  set.seed(1)
+  model.sample = round(model.w*s,0) #number of samples in each cluster
+  discretization = apply(model.sample,1,sum) # may > s due to rounding
+  r.list = list()
+  for (i in 1:4688) {
+    r.vector = matrix(0,m,22)
+    for (k in 1:4) {
+      u = GMM_model$Mu[[i]][k,] #mean for cluster k
+      v = GMM_model$Sig[[i]][,,k] #covariance for cluster k
+      for (j in 1:model.sample[i,k]){
+        r = mvrnorm(m,u,v) #generate new samples for stock returns
+        r.vector = r.vector + r
+      }
+    }
+    r.list[[i]] = r.vector/discretization[i]
+    print(i)
+  }
+  return(return=r.list)
+}
+MC_sim = MC(4096,5)
+
+#==============================================================================#
+#                       Run RQMC to simulate m paths                           #
+# Input: m is the number of paths to simulate, s the number of bins            #
+#==============================================================================#
+RQMC <- function(m,s) {
+  set.seed(1)
+  model.sample = round(model.w*s,0) #number of samples in each cluster
+  discretization = apply(model.sample,1,sum) #may > s due to rounding
+  r.list = list()
+  for (i in 1:4688) {
+    r.vector = matrix(0,m,22)
+    for (k in 1:4) {
+      u = GMM_model$Mu[[i]][k,] #mean for cluster k
+      v = GMM_model$Sig[[i]][,,k] #covariance matrix for cluster k
+      u.rep = matrix(rep(u,m),22,m,byrow=F)
+      if (is.positive.definite(v) == F) {v = nearPD(v)$mat}
+      chol.v = t(chol(v))
+      for (j in 1:model.sample[i,k]) {
+        U = sobol(m, 22, randomize = c("digital.shift")) #generate new samples
+        z = qnorm(U)
+        r = u.rep + chol.v %*% t(z)
+        r.vector = r.vector + t(r)
+      }
+    }
+    r.list[[i]] = r.vector/discretization[i]
+    print(i)
+  }
+    return(return=r.list)
+}
+
+RQMC_sim = RQMC(4096,5)
+
+#==============================================================================#
+#                    Get volatility to adjust Return                           #
+#                                                                              #
+# method: first get volatility estimated by GARCH(1,1),                        #
+#         then adjust daily return by                                          #
+#         (largest volatility in past 10 days)/mean(volatility in past 250 days)
+#==============================================================================#
+# Train GARCH(1,1) to capture volatility clustering
+spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                  variance.model = list(model="gjrGARCH"),
+                  distribution.model="sstd")
+volatility_garch = NULL
+for (i in 1:22) {
+  fit <- ugarchfit(spec, P_hat[,i], solver="hybrid")
+  volatility_garch = cbind(volatility_garch,as.numeric(sigma(fit)))
+  print(i)
+}
+save(volatility_garch, file = "gmm_v_garch.Rdata")
+
+adj_v <- function(data, d) {
+  data = as.matrix(data)
+  s = matrix(NA, 4688, 22)
+  f <- function(x,y) {adj = mean(tail(y, d))/mean(y)}
+  for (i in 1:4688) {
+    for (j in 1:22) {
+      df = data[i:(i+249),j]
+      garch = volatility_garch[i:(i+249),j]
+      v = f(df,garch)
+      s[i,j] = v
+    }
+  }
+  return(s)
+}
+gmm_v = adj_v(P_hat,21)
+#==============================================================================#
+#                           Estimate VaR and ES                                #
+#==============================================================================#
+gmm.risk <- function(pathlist, volatility, weight) {
+  gmm_r = list() #estimated portfolio return by GMM (in negated log)
+  VaR = NULL
+  ES = NULL
+  m = nrow(pathlist[[1]]) #get number of paths
+  for (i in 1:4688) {
+    V = volatility[i,]
+    aj = matrix(rep(V,m),m, byrow = T)
+    r.vector = as.matrix(pathlist[[i]])
+    r.vector[r.vector<(-log(1.1)*100)] = -log(1.1)*100 #set price limit
+    R = r.vector * aj #adjust simulated returns by volatility
+    R[R<(-log(1.1)*100)] = -log(1.1)*100
+    p_r = R %*% weight[i,] #negated portfolio return in percentage
+    gmm_r[[i]] = p_r
+    p_r.sort = sort(p_r,decreasing = T)
+    p_r.w = p_r.sort[2000:3000] #select the middle 1000 scenarios only
+    var =  quantile(p_r.w,0.975)
+    es = mean(p_r.w[p_r.w >= var])
+    VaR = c(VaR, var)
+    ES = c(ES, es)
+    n = length(which(p_r.w >= var))
+    print(i)
+  }
+  return(list(VaR=VaR, ES=ES, r=list.cbind(gmm_r)))
+}
+
+#==============================================================================#
+#                       Forecast ES and VaR for 4 portfolios                   #
+#==============================================================================#
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_w.Rdata") # load weight for naive
+naive_RQMC = gmm.risk(RQMC_sim, gmm_v, naive_weight[-(1:251),])
+naive.gmm = data.frame(VaR = naive_RQMC$VaR, ES = naive_RQMC$ES)
+save(naive.gmm, file = "naive_gmm.Rdata")
+
+load("C:/Users/1/OneDrive/桌面/portfolio/meanvar_w.Rdata") #weight for mv
+mv_RQMC = gmm.risk(RQMC_sim, gmm_v, w)
+mv.gmm = data.frame(VaR = mv_RQMC$VaR, ES = mv_RQMC$ES)
+save(mv.gmm, file = "mv_gmm.Rdata")
+
+load("C:/Users/1/OneDrive/桌面/portfolio/min_ES_w.Rdata") #weight for min_ES
+minES_RQMC = gmm.risk(RQMC_sim, gmm_v, weight)
+minES.gmm = data.frame(VaR = minES_RQMC$VaR, ES = minES_RQMC$ES)
+save(minES.gmm, file = "minES_gmm.Rdata")
+
+load("C:/Users/1/OneDrive/桌面/portfolio/max_R_w.Rdata") #weight for max_Return
+maxR_RQMC = gmm.risk(RQMC_sim, gmm_v, weight)
+maxR.gmm = data.frame(VaR = maxR_RQMC$VaR, ES = maxR_RQMC$ES)
+save(maxR.gmm, file = "maxR_gmm.Rdata")
+
+#==============================================================================#
+#                       plot each portfolio and its risk estimates             #
+#                  Note: use negated percentage log returns throughout         #
+#==============================================================================#
+###============================== data prep =================================###
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_portfolio.Rdata") 
+# load naive 1/N portfolio (in value); dataframe name is file name
+naive_return = -log(naive_portfolio$Value[-1]/naive_portfolio$Value[-4939])*100 
+# transform into negated percentage log returns
+
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_return.Rdata") 
+# load mean-variance portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/min_ES.Rdata") 
+# load minimum ES portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/max_return.Rdata") 
+# load maximum return portfolio (in log returns); dataframe name is file name
+
+###================================ Naive ===================================###
+plot(y=naive_return[-(1:250)],type="l",
+     x=portfolio$Date[-(1:251)],ylim=c(-10,15),
+     xlab="Time", ylab="Negated log returns %",
+     main='naive 1/N')
+for (i in 1:1000) {
+  lines(naive_RQMC$r[i,],x=portfolio$Date[-(1:251)],col='#B4AB1E')
+  print(i)
+}
+lines(y=naive_return[-(1:250)],x=portfolio$Date[-(1:251)])
+legend("bottomright",
+       legend = c("Realized","1000 sim"),
+       lty = c(1,1),
+       lwd = c(1.5,1.5),
+       col = c("black","#B4AB1E"),
+       cex = 0.5)
+
+plot(y=naive_return[-(1:250)],type="l",
+     x=portfolio$Date[-(1:251)],ylim=c(-10,15),
+     xlab="Time", ylab="Negated log returns %",
+     main='naive 1/N')
+lines(y=naive_RQMC$VaR,x=portfolio$Date[-(1:251)],col="#CB125E",lty=1)
+lines(y=naive_RQMC$ES,x=portfolio$Date[-(1:251)],col="#17906F",lty=1)
+legend("bottomright",
+       legend = c("Realized","97.5% VaR","97.5% ES"),
+       lty = c(1,2,2),
+       lwd = c(1.5,1.5,1.5),
+       col = c("black","#CB125E","#17906F"),
+       cex = 0.5)
+
+###============================= Mean-Variance ==============================###
+plot(y=-mv_return$value*100,type="l",ylim=c(-10,15),
+     x=portfolio$Date[-(1:251)],
+     xlab="Time", ylab="Negated log returns %",
+     main="mean-variance")
+for (i in 1:1000) {
+  lines(mv_RQMC$r[i,],x=portfolio$Date[-(1:251)],col='#B4AB1E')
+  print(i)
+}
+lines(y=-mv_return$value*100,x=portfolio$Date[-(1:251)])
+legend("bottomright",
+       legend = c("Realized","1000 sim"),
+       lty = c(1,1),
+       lwd = c(1.5,1.5),
+       col = c("black","#B4AB1E"),
+       cex = 0.5)
+
+plot(y=-mv_return$value*100,type="l",ylim=c(-10,15),
+     x=portfolio$Date[-(1:251)],
+     xlab="Time", ylab="Negated log returns %",
+     main="mean-variance")
+lines(y=mv_RQMC$VaR,x=portfolio$Date[-(1:251)],col="#CB125E",lty=1)
+lines(y=mv_RQMC$ES,x=portfolio$Date[-(1:251)],col="#17906F",lty=1)
+legend("bottomright",
+       legend = c("Realized","97.5% VaR","97.5% ES"),
+       lty = c(1,2,2),
+       lwd = c(1.5,1.5,1.5),
+       col = c("black","#CB125E","#17906F"),
+       cex = 0.5)
+
+###=============================== Min ES ===================================###
+plot(y=-min_ES$value*100,type="l",
+     x=portfolio$Date[-(1:251)],ylim=c(-10,15),
+     xlab="Time", ylab="Negated log returns %",
+     main="min ES")
+for (i in 1:1000) {
+  lines(minES_RQMC$r[i,],x=portfolio$Date[-(1:251)],col='#B4AB1E')
+  print(i)
+}
+lines(y=-min_ES$value*100,x=portfolio$Date[-(1:251)])
+legend("bottomright",
+       legend = c("Realized","1000 sim"),
+       lty = c(1,1),
+       lwd = c(1.5,1.5),
+       col = c("black","#B4AB1E"),
+       cex = 0.5)
+
+plot(y=-min_ES$value*100,type="l",
+     x=portfolio$Date[-(1:251)],ylim=c(-10,15),
+     xlab="Time", ylab="Negated log returns %",
+     main="min ES")
+lines(y=minES_RQMC$VaR,x=portfolio$Date[-(1:251)],col="#CB125E",lty=1)
+lines(y=minES_RQMC$ES,x=portfolio$Date[-(1:251)],col="#17906F",lty=1)
+legend("bottomright",
+       legend = c("Realized","97.5% VaR","97.5% ES"),
+       lty = c(1,2,2),
+       lwd = c(1.5,1.5,1.5),
+       col = c("black","#CB125E","#17906F"),
+       cex = 0.5)
+
+###============================= Max Return =================================###
+plot(y=-max_return$value*100,type="l",
+     x=portfolio$Date[-(1:251)],ylim=c(-10,25),
+     xlab="Time", ylab="Negated log returns %",
+     main="max return")
+for (i in 1:1000) {
+  lines(maxR_RQMC$r[i,],x=portfolio$Date[-(1:251)],col='#B4AB1E')
+  print(i)
+}
+lines(y=-max_return$value*100,x=portfolio$Date[-(1:251)])
+legend("bottomright",
+       legend = c("Realized","1000 sim"),
+       lty = c(1,1),
+       lwd = c(1.5,1.5),
+       col = c("black","#B4AB1E"),
+       cex = 0.5)
+
+plot(y=-max_return$value*100,type="l",
+     x=portfolio$Date[-(1:251)],ylim=c(-10,25),
+     xlab="Time", ylab="Negated log returns %",
+     main="max return")
+lines(y=maxR_RQMC$VaR,x=portfolio$Date[-(1:251)],col="#CB125E",lty=1)
+lines(y=maxR_RQMC$ES,x=portfolio$Date[-(1:251)],col="#17906F",lty=1)
+legend("bottomright",
+       legend = c("Realized","97.5% VaR","97.5% ES"),
+       lty = c(1,2,2),
+       lwd = c(1.5,1.5,1.5),
+       col = c("black","#CB125E","#17906F"),
+       cex = 0.5)
+#==============================================================================#
+#              E-backtest ES forecasts produced by the GMM approach            #
+#==============================================================================#
+source("Ebacktest_general.R")
+
+yearly_test <- function(realized,ES,VaR,start,date) {
+  s = seq(from=start,to=length(realized),by=250) #yearly monitoring
+  breach1 = NULL
+  breach2 = NULL
+  breach3 = NULL
+  breach4 = NULL
+  for (i in s) {
+    test = M_l(realized, ES, VaR, 0.975, i, 250)
+    breach1 = c(breach1, date[i])
+    d1 = which(test$M_GREE > 10)[1] - i
+    breach2 = c(breach2, d1)
+    d2 = which(test$M_GREL > 10)[1] - i
+    breach3 = c(breach3, d2)
+    d3 = which(test$M_GREM > 10)[1] - i
+    breach4 = c(breach4, d3)
+    print(i)
+  }
+  return(data.frame(test_date=as.Date(breach1),
+                    GREE=breach2,
+                    GREL=breach3,
+                    GREM=breach4))
+}
+
+naive.t = M_l(naive_return[-(1:500)], 
+              naive_RQMC$ES,
+              naive_RQMC$VaR,
+              0.975, 251, 250)
+
+mv.t = M_l(-mv_return$value[-(1:250)]*100, 
+              mv_RQMC$ES,
+              mv_RQMC$VaR,
+              0.975, 251, 250)
+
+minES.t = M_l(-min_ES$value[-(1:250)]*100, 
+           minES_RQMC$ES,
+           minES_RQMC$VaR,
+           0.975, 251, 250)
+
+maxR.t = M_l(-max_return$value[-(1:250)]*100, 
+              maxR_RQMC$ES,
+              maxR_RQMC$VaR,
+              0.975, 251, 250)
+
+
+plot(y=naive.t$M_GREM,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREM")
+lines(y=mv.t$M_GREM,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.t$M_GREM,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.t$M_GREM,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+plot(y=naive.t$M_GREE,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREE")
+lines(y=mv.t$M_GREE,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.t$M_GREE,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.t$M_GREE,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+
+plot(y=naive.t$M_GREL,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREL")
+lines(y=mv.t$M_GREL,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.t$M_GREL,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.t$M_GREL,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+
+
+T_naive_MC = daily_test(-naive_return[-(1:250)],
+                        naive_MC$gmm_ES,naive_MC$gmm_VaR,501,date)
+T_naive_RQMC = daily_test(-naive_return[-(1:250)],
+                          naive_RQMC$gmm_ES,naive_RQMC$gmm_VaR,501,date)
+T_naive_emp = daily_test(-naive_return[-(1:500)],
+                         emp_naive$emp_ES,emp_naive$emp_VaR,251,date[-(1:250)])
+
+T_mv_MC = daily_test(-mv_return$value,
+                     mv_MC$gmm_ES,mv_MC$gmm_VaR,501,date)
+T_mv_RQMC = daily_test(-mv_return$value,
+                       mv_RQMC$gmm_ES,mv_RQMC$gmm_VaR,501,date)
+T_mv_emp = daily_test(-mv_return$value[-(1:250)],
+                      emp_mv$emp_ES,emp_mv$emp_VaR,251,date[-(1:250)])
+
+T_minES_MC = daily_test(-min_ES$value,
+                        minES_MC$gmm_ES,minES_MC$gmm_VaR,501,date)
+T_minES_RQMC = daily_test(-min_ES$value,
+                          minES_RQMC$gmm_ES,minES_RQMC$gmm_VaR,501,date)
+T_minES_emp = daily_test(-min_ES$value[-(1:250)],
+                         emp_minES$emp_ES,emp_minES$emp_VaR,251,date[-(1:250)])
+
+T_maxR_MC = daily_test(-max_return$value,
+                       maxR_MC$gmm_ES,maxR_MC$gmm_VaR,501,date)
+T_maxR_RQMC = daily_test(-max_return$value,
+                         maxR_RQMC$gmm_ES,maxR_RQMC$gmm_VaR,501,date)
+T_maxR_emp = daily_test(-max_return$value[-(1:250)],
+                        emp_maxR$emp_ES,emp_maxR$emp_VaR,251,date[-(1:250)])
