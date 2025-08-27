@@ -1,0 +1,633 @@
+#==============================================================================#
+#                             Forecasting VaR and ES                           #
+#              by GARCH, GARCH-EVT, GARCH-FHS and the empirical methods        #
+#                                                                              #
+# Quick Summary:                                                               #
+# Assume the return {Xt} is an AR(1)-GARCH(1,1) process with innovations {Zt}  #
+# coming from normal, student t, and skewed-t distributions, and use GARCH,    #
+# GARCH-EVT, and GARCH-FHS to forecast VaR and ES respectively.                #
+# Also, the empirical method is included as the end. A 250-day moving window   #
+# is applied to all methods.                                                   #
+#                                                                              #
+# Input: use negated percentage log returns                                    #
+#                                                                              #
+# 1. GARCH model:                                                              #
+# The sequence of returns is modeled as an AR(1)-GARCH(1,1) process.           #
+#                                                                              #
+# 2. GARCH-EVT:                                                                #
+#    This method is proposed in McNeil and Frey (2000), which softens impact   # 
+#    of inappropriate innovations in GARCH models by incorporating EVT to model# 
+#    the tail.                                                                 #
+#                                                                              #
+# 3. GARCH-FHS                                                                 #
+#    This methods rescale historical returns by the underlying conditional     # 
+#    volatilities and perform empirical estimation on a simulated sample. I    #
+#    use the method in Nolde and Ziegel (2017), which randomly draws           #
+#    (with replacement) a sample of 10,000 observations from the standardized  # 
+#    residuals and then take empirical VaR and ES to calculate the conditional # 
+#    VaR and ES based on the GARCH model.                                      #
+#                                                                              #
+# Reference:                                                                   #
+# The GARCH-FHS method I used is propsed in the following paper:               #
+# [N. Nolde and J. F. Ziegel. Elicitability and backtesting: Perspectives for  # 
+# banking regulation (with discussion). Annals of Applied Statistics,          #
+# 11(4):1833–1874, 2017.]                                                      #
+#                                                                              #
+# Claim:                                                                       #
+# Their code is published on Github. The following code is written based on    # 
+# my understanding of their code instead of copy&paste.                        #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+setwd("C:/Users/1/OneDrive/桌面/portfolio")
+install.packages("zoo")
+install.packages("xts")
+install.packages("qrmtools")
+install.packages("tseries")
+install.packages("fGarch")
+install.packages("skewt") 
+install.packages("sgt")
+install.packages("betategarch")
+install.packages("ismev")
+install.packages('POT')
+install.packages("pracma")
+library(zoo)
+library(xts)
+library(rugarch)
+library(qrmtools)
+library(tseries)
+library(fGarch)
+library(skewt)
+library(sgt)
+library(betategarch)
+library(ismev)
+library(PerformanceAnalytics)
+library(POT)
+library(pracma)
+
+#==============================================================================#
+#                         Load and prepare datasets                            #
+#                    descriptions are given after each line                    #
+#==============================================================================#
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_portfolio.Rdata") 
+# load naive 1/N portfolio (in value); dataframe name is file name
+naive_return = -log(naive_portfolio$Value[-1]/naive_portfolio$Value[-4939])*100 
+# transform into negated percentage log returns
+
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_return.Rdata") 
+# load mean-variance portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/min_ES.Rdata") 
+# load minimum ES portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/max_return.Rdata") 
+# load maximum return portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/SSE_return100.Rdata") 
+# load SSE index returns (in percentage log returns); dataframe name: SSE.ret
+
+load("C:/Users/1/OneDrive/桌面/portfolio/RMBUSD_return100.Rdata") 
+# load RMB/USD returns (in percentage log returns); dataframe name: RMBUSD.ret
+
+load("C:/Users/1/OneDrive/桌面/portfolio/CBA_return100.Rdata") 
+# load ChinaBond new composite index returns (in percentage log returns);
+# dataframe name: CBA.ret
+
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99_return100")
+# load AU9999 price (in percentage log returns); dataframe name: AU99.ret
+
+#==============================================================================#
+#                  Select the threshold u under the EVT approach               #
+#                      (use negated percentage log returns)                    #
+#==============================================================================#
+spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                  distribution.model="norm") 
+
+#================================= naive ======================================#
+fit = ugarchfit(spec,Return.clean(naive_return, method="boudt"),
+                solver="hybrid")
+naive.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(naive.garch.res,type="l",xlab="time"); mrl.plot(naive.garch.res,umin=-2)
+
+#=================================  mv ========================================#
+fit = ugarchfit(spec,Return.clean(-mv_return$value*100, method="boudt"),
+                solver="hybrid")
+mv.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(mv.garch.res,type="l",xlab="time"); mrl.plot(mv.garch.res,umin = -2)
+
+#================================ min ES ======================================#
+fit = ugarchfit(spec,Return.clean(-min_ES$value*100, method="boudt"),
+                solver="hybrid")
+minES.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(minES.garch.res,type="l",xlab="time")
+mrl.plot(minES.garch.res,umin=-2)
+
+#================================= max R ======================================#
+fit = ugarchfit(spec,Return.clean(-max_return$value*100, method="boudt"),
+                solver="hybrid")
+maxR.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(maxR.garch.res,type="l",xlab="time")
+mrl.plot(maxR.garch.res,umin=-2)
+
+#================================= SSE ========================================#
+fit = ugarchfit(spec,-SSE.ret$return,solver="hybrid")
+SSE.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(SSE.garch.res,type="l",xlab="time"); mrl.plot(SSE.garch.res,umin=-2)
+
+#================================= CBA ========================================#
+fit = ugarchfit(spec,-CBA.ret$return,solver="hybrid")
+CBA.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(CBA.garch.res,type="l",xlab="time"); mrl.plot(CBA.garch.res,umin=-4)
+
+#================================= AU99 =======================================#
+fit = ugarchfit(spec,-AU99.ret$return,solver="hybrid")
+AU99.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(AU99.garch.res,type="l",xlab="time"); mrl.plot(AU99.garch.res,umin=-2)
+
+#================================= RMB ========================================#
+fit = ugarchfit(spec,-RMBUSD.ret$return,solver="hybrid")
+RMB.garch.res = as.numeric(residuals(fit)/sigma(fit))
+par(mfrow=c(1,2))
+plot(RMB.garch.res,type="l",xlab="time"); mrl.plot(RMB.garch.res,umin=-7)
+
+#==============================================================================#
+#                           one-day ahead forecast                             #
+#                 for POP-EVT, u is the threshold selected                     #
+#==============================================================================#
+forecast <- function(fit, l, qmodel, esmodel,n=10^5,seed,u)
+{
+  resid=residuals(fit)
+  sigma.t=sigma(fit)
+  z=resid/sigma.t #use standardized residuals (iid) in EVT
+  z=as.numeric(z)
+  
+  frcst = ugarchforecast(fit,n.ahead=1)
+  sigt1 = sigma(frcst)
+  mut1 = fitted(frcst)
+  
+  # sampling with replacement from the standardized residuals
+  set.seed(seed)
+  zt1=sample(z, size=n, replace=TRUE)
+  qFHS = quantile(zt1,l)
+  esFHS = mean(zt1[zt1 >= qFHS])
+  
+  # quantile based on EVT-POT method (McNeil & Frey, 2000), see page 12
+  p = length(z[z>=u])/length(z) 
+  if (p>0.09) {
+    k=round(p*length(z),0) # upper order statistic as a threshold
+    u=sort(z,decreasing=T)[k+1] # threshold
+    GPDfit = gpd.fit(z,threshold=u,show=F)
+    beta=GPDfit$mle[1]; xi=GPDfit$mle[2] # MLE's of scale and shape parameters
+    qPOT = u + beta/xi*(((1-l)/(k/length(z)))^(-xi)-1) # see 14 on page 206
+    esPOT = qPOT/(1-xi) + (beta - xi*u)/(1-xi) # see 15 on page 206
+  } 
+  else {qPOT = qmodel; esPOT = esmodel}
+  
+  # VaR forecasts for the next period
+  VaRmodel=max(mut1 + sigt1*qmodel,0)
+  VaRfhs=max(mut1 + sigt1*qFHS,0)
+  VaRevt=max(mut1 + sigt1*qPOT,0)
+  
+  # ES forecasts for the next period
+  es.model= max(mut1 + sigt1*esmodel,VaRmodel)
+  es.fhs  = max(mut1 + sigt1*esFHS,VaRfhs)
+  es.evt  = max(mut1 + sigt1*esPOT,VaRevt)
+ 
+  return(list(VaRmodel=VaRmodel,VaRfhs=VaRfhs,VaRevt=VaRevt,
+              ESmodel=es.model, ESfhs=es.fhs, ESevt=es.evt))
+}
+
+#==============================================================================#
+#                 Risk forecast: Normal distribution for errors                #
+#                       w is the size of moving window                         #
+#                           control = list(tol = )                             #
+#==============================================================================#
+forecast.n <- function(x,w,control) {
+  N = length(x); lvec = 0.975
+  ES_n <- matrix(nrow=(N-w),ncol=1); VaR_n <- matrix(nrow=(N-w),ncol=1)
+  ES_n.evt <- matrix(nrow=(N-w),ncol=1); VaR_n.evt <- matrix(nrow=(N-w),ncol=1)
+  ES_n.fhs <- matrix(nrow=(N-w),ncol=1); VaR_n.fhs <- matrix(nrow=(N-w),ncol=1)
+  spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                    distribution.model="norm") 
+  qmodel = qdist("norm",p=lvec, mu=0, sigma=1)
+  esmodel = (ddist("norm",qdist("norm",p=lvec,mu=0,sigma=1),mu=0,sigma=1))/(1-lvec)
+  for (i in 1:(N-w)) { 
+    subset = Return.clean(x[i:(i+w-1)], method="boudt") #clean data
+    fit = ugarchfit(spec, subset, solver="hybrid",
+                    solver.control = control)
+    foc = forecast(fit, lvec, qmodel, esmodel, n=10^5, i,2)
+    ES_n[i,] = foc$ESmodel
+    VaR_n[i,] = foc$VaRmodel
+    ES_n.evt[i,] = foc$ESevt
+    VaR_n.evt[i,] = foc$VaRevt
+    ES_n.fhs[i,] = foc$ESfhs
+    VaR_n.fhs[i,] = foc$VaRfhs
+    print(i)
+  }  
+  return(list(ES_n=ES_n,VaR_n=VaR_n,ES_n.evt=ES_n.evt,VaR_n.evt=VaR_n.evt,
+              ES_n.fhs=ES_n.fhs,VaR_n.fhs=VaR_n.fhs))
+}
+
+#==============================================================================#
+#                    Risk forecast: t distribution for errors                  #
+#                       w is the size of moving window                         #
+#==============================================================================#
+forecast.t <- function(x,w,control) {#control = list(tol = )
+  N = length(x); lvec = 0.975
+  ES_t <- matrix(nrow=(N-w),ncol=1); VaR_t <- matrix(nrow=(N-w),ncol=1)
+  ES_t.evt <- matrix(nrow=(N-w),ncol=1); VaR_t.evt <- matrix(nrow=(N-w),ncol=1)
+  ES_t.fhs <- matrix(nrow=(N-w),ncol=1); VaR_t.fhs <- matrix(nrow=(N-w),ncol=1)
+  spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                    distribution.model="std")
+  for (i in 1:(N-w)) {
+    subset = Return.clean(x[i:(i+w-1)], method="boudt") #clean data
+    fit = ugarchfit(spec, subset, solver="hybrid",solver.control = control)
+    df_t = coef(fit)["shape"]
+    qmodel = qt(p=lvec,df=df_t)
+    esmodel = integrate(function(x) x*dt(x,df=df_t),qmodel,Inf)$value/(1-lvec)
+    qmodel = qmodel * sqrt((df_t-2)/df_t)
+    esmodel = esmodel * sqrt((df_t-2)/df_t) #adjust to have mean 0,var 1
+    foc = forecast(fit, lvec, qmodel, esmodel, n=10^5, i,2)
+    ES_t[i,] = foc$ESmodel
+    VaR_t[i,] = foc$VaRmodel
+    ES_t.evt[i,] = foc$ESevt
+    VaR_t.evt[i,] = foc$VaRevt
+    ES_t.fhs[i,] = foc$ESfhs
+    VaR_t.fhs[i,] = foc$VaRfhs
+    print(i)
+  }  
+  return(list(ES_t=ES_t,VaR_t=VaR_t,ES_t.evt=ES_t.evt,VaR_t.evt=VaR_t.evt,
+              ES_t.fhs=ES_t.fhs,VaR_t.fhs=VaR_t.fhs))
+}
+
+#==============================================================================#
+#                 Risk forecast: skewed-t distribution for errors              #
+#                       w is the size of moving window                         #
+#==============================================================================#
+forecast.skt <- function(x,w,control) {#control = list(tol = )
+  N = length(x); lvec = 0.975
+  ES_skt <- matrix(nrow=(N-w),ncol=1); 
+  VaR_skt <- matrix(nrow=(N-w),ncol=1)
+  ES_skt.evt <- matrix(nrow=(N-w),ncol=1); 
+  VaR_skt.evt <- matrix(nrow=(N-w),ncol=1)
+  ES_skt.fhs <- matrix(nrow=(N-w),ncol=1); 
+  VaR_skt.fhs <- matrix(nrow=(N-w),ncol=1)
+  spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                    distribution.model="sstd")
+  
+  for (i in 1:(N-w)) {
+    subset = Return.clean(x[i:(i+w-1)], method="boudt") #clean data
+    fit = ugarchfit(spec, subset, solver="hybrid", 
+                    solver.control = control)
+    nu = coef(fit)["shape"]; ga = coef(fit)["skew"]
+    # ======================================================================== #
+    # Use the forecasts in Appendix B.4 in (Patton el al., 2019)
+    qmodel = qsgt(lvec,mu=0,sigma=1,lambda=(ga^2-1)/(ga^2+1),p=2,q=nu/2)
+    # parameters of Hansen (1994)
+    lam = -(ga^2-1)/(ga^2+1) 
+    c = gamma((nu+1)/2) / (gamma(nu/2) * sqrt(pi * (nu-2)))
+    a = 4*lam*c*(nu-2)/(nu-1)
+    b = sqrt(1+3*lam^2-a^2)
+    # Calculate explicit ES for skewed-t described in Patton et al. (2019)
+    # We make some transformation here because we are handling loss data
+    if(qmodel >= (a/b))
+    {
+      alpha_tilde1 = psgt(b/(1-lam)*(-qmodel+a/b),mu=0,sigma=1,lambda=0,p=2,q=nu/2)
+      es_t1 = sqrt((nu-2)/nu) * nu^(nu/2)/(2*(alpha_tilde1)*sqrt(pi))*
+        gamma((nu-1)/2)/gamma(nu/2)*(qt(1-alpha_tilde1, df=nu)^2+nu)^((1-nu)/2) 
+      # ES for standardized t
+      esmodel = -(alpha_tilde1)/(1-lvec)* (1-lam) * (-a/b - (1-lam)/b*es_t1)
+    }
+    else
+    {
+      lam2 = -lam
+      ga2 = 1/ga
+      nu2 = nu
+      c2 = c
+      a2 = 4*lam2*c2*(nu2-2)/(nu2-1)
+      b2 = b
+      alpha_tilde2 = psgt(b2/(1-lam2)*(qsgt(lvec,mu=0,sigma=1,
+                                            lambda=lam2,p=2,q=nu2/2)+a2/b2),
+                          mu=0,sigma=1,lambda=0,p=2,q=nu2/2)
+      es_t2 = sqrt((nu2-2)/nu2) * nu2^(nu2/2)/(2*(alpha_tilde2)*sqrt(pi))*
+        gamma((nu2-1)/2)/gamma(nu2/2)*(qt(1-alpha_tilde2, df=nu2)^2+nu2)^((1-nu2)/2)
+      esmodel = -(alpha_tilde2)/(1-lvec) * (1-lam2) * (-a2/b2 - (1-lam2)/b2*es_t2)
+    }
+    foc = forecast(fit, lvec, qmodel, esmodel, n=10^5, i,2)
+    ES_skt[i,] = foc$ESmodel
+    VaR_skt[i,] = foc$VaRmodel
+    ES_skt.evt[i,] = foc$ESevt
+    VaR_skt.evt[i,] = foc$VaRevt
+    ES_skt.fhs[i,] = foc$ESfhs
+    VaR_skt.fhs[i,] = foc$VaRfhs
+    print(i)
+  }  
+  return(list(ES_skt=ES_skt,VaR_skt=VaR_skt,
+              ES_skt.evt=ES_skt.evt,VaR_skt.evt=VaR_skt.evt,
+              ES_skt.fhs=ES_skt.fhs,VaR_skt.fhs=VaR_skt.fhs))
+}
+
+#==============================================================================#
+#                         Risk forecast: empirical method                      #
+#                          w is the size of moving window                      #
+#==============================================================================#
+forecast.emp <- function(x,w) {
+  N = length(x); lvec = 0.975
+  ES_emp <- matrix(nrow=(N-w),ncol=1)
+  VaR_emp <- matrix(nrow=(N-w),ncol=1)
+  for (i in 1:(N-w)) {
+    data = x[i:(i+w-1)]
+    qEmp = quantile(data,lvec)
+    esEmp = mean(data[data >= qEmp])
+    ES_emp[i,] = esEmp
+    VaR_emp[i,] = qEmp
+  }
+  return(list(ES_emp=ES_emp,VaR_emp=VaR_emp))
+}
+
+#==============================================================================#
+#                       Get and save estimates for ES and VaR                  #
+#==============================================================================#
+naive.skt=forecast.skt(naive_return[-(1:250)],250,list()) 
+save(naive.skt, file = "naive_skt.Rdata")
+naive.t=forecast.t(naive_return[-(1:250)],250,list())
+save(naive.t, file = "naive_t.Rdata")
+naive.n=forecast.n(naive_return[-(1:250)],250,list())
+save(naive.n, file = "naive_n.Rdata")
+naive.emp=forecast.emp(naive_return[-(1:250)],250)
+save(naive.emp, file = "naive_emp.Rdata")
+
+mv.skt=forecast.skt(-mv_return$value*100,250,list(tol=1e-5))
+save(mv.skt, file = "mv_skt.Rdata")
+mv.t=forecast.t(-mv_return$value*100,250,list(tol=1e-4))
+save(mv.t, file = "mv_t.Rdata")
+mv.n=forecast.n(-mv_return$value*100,250,list(tol=1e-5))
+save(mv.n, file = "mv_n.Rdata")
+mv.emp=forecast.emp(-mv_return$value*100,250)
+save(mv.emp, file = "mv_emp.Rdata")
+
+minES.skt=forecast.skt(-min_ES$value*100,250,list(tol=1e-5))
+save(minES.skt, file = "minES_skt.Rdata")
+minES.t=forecast.t(-min_ES$value*100,250,list(tol=1e-4))
+save(minES.t, file = "minES_t.Rdata")
+minES.n=forecast.n(-min_ES$value*100,250,list(tol=1e-6))
+save(minES.n, file = "minES_n.Rdata")
+minES.emp=forecast.emp(-min_ES$value*100,250)
+save(minES.emp, file = "minES_emp.Rdata")
+
+maxR.skt=forecast.skt(-max_return$value*100,250,list())
+save(maxR.skt, file = "maxR_skt.Rdata")
+maxR.t=forecast.t(-max_return$value*100,250,list())
+save(maxR.t, file = "maxR_t.Rdata")
+maxR.n=forecast.n(-max_return$value*100,250,list())
+save(maxR.n, file = "maxR_n.Rdata")
+maxR.emp=forecast.emp(-max_return$value*100,250)
+save(maxR.emp, file = "maxR_emp.Rdata")
+
+SSE.skt=forecast.skt(-SSE.ret$return,250,list())
+SSE.t=forecast.t(-SSE.ret$return,250,list())
+SSE.n=forecast.n(-SSE.ret$return,250,list())
+SSE.emp=forecast.emp(-SSE.ret$return,250)
+save(SSE.skt, file = "SSE_skt.Rdata")
+save(SSE.t, file = "SSE_t.Rdata")
+save(SSE.n, file = "SSE_n.Rdata")
+save(SSE.emp, file = "SSE_emp.Rdata")
+
+CBA.skt=forecast.skt(-CBA.ret$return,250,list())
+CBA.t=forecast.t(-CBA.ret$return,250,list())
+CBA.n=forecast.n(-CBA.ret$return,250,list())
+CBA.emp=forecast.emp(-CBA.ret$return,250)
+save(CBA.skt, file = "CBA_skt.Rdata")
+save(CBA.t, file = "CBA_t.Rdata")
+save(CBA.n, file = "CBA_n.Rdata")
+save(CBA.emp, file = "CBA_emp.Rdata")
+
+AU99.skt=forecast.skt(-AU99.ret$return,250,list())
+AU99.t=forecast.t(-AU99.ret$return,250,list())
+AU99.n=forecast.n(-AU99.ret$return,250,list())
+AU99.emp=forecast.emp(-AU99.ret$return,250)
+save(AU99.skt, file = "AU99_skt.Rdata")
+save(AU99.t, file = "AU99_t.Rdata")
+save(AU99.n, file = "AU99_n.Rdata")
+save(AU99.emp, file = "AU99_emp.Rdata")
+
+RMB.skt=forecast.skt(-RMBUSD.ret$return,250,list(tol=1e-6))
+RMB.t=forecast.t(-RMBUSD.ret$return,250,list(tol=1e-5))
+RMB.n=forecast.n(-RMBUSD.ret$return,250,list(tol=1e-6))
+RMB.emp=forecast.emp(-RMBUSD.ret$return,250)
+save(RMB.skt, file = "RMB_skt.Rdata")
+save(RMB.t, file = "RMB_t.Rdata")
+save(RMB.n, file = "RMB_n.Rdata")
+save(RMB.emp, file = "RMB_emp.Rdata")
+
+#==============================================================================#
+#                                    Plot                                      #
+#                 use negated percentage log returns throughout                #
+#==============================================================================#
+###================================ Naive ===================================###
+plot(y=naive_return[-(1:500)],type="l",ylim=c(-10,15),
+     ylab="negated log returns %",xlab="Time",main="naive 1/N: 97.5% ES",
+     x=min_ES$date[-(1:250)],lwd=1)
+lines(y=-naive.LSTM$ES[-(1:250)],x=min_ES$date[-(1:250)],col="#B08996")
+lines(y=naive.n$ES_n,col="lightblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.n$ES_n.evt,col="olivedrab",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.n$ES_n.fhs,col="palevioletred",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.t$ES_t,col="royalblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.t$ES_t.evt,col="darkorange3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.t$ES_t.fhs,col="#F0E68C",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.skt$ES_skt,col="#227252",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.skt$ES_skt.evt,col="#B4AB2f",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.skt$ES_skt.fhs,col="darkseagreen3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=naive.emp$ES_emp,col="#CB125E",x=min_ES$date[-(1:250)],lwd=1.5)
+legend("bottomright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 0)
+
+###================================ min_ES ==================================###
+plot(y=-min_ES$value[-(1:250)]*100,type="l",ylim=c(-10,25),
+     ylab="negated log returns %",xlab="Time",main="min ES: 97.5% ES",
+     x=min_ES$date[-(1:250)],lwd=1)
+lines(y=-minES.LSTM$ES*100,x=min_ES$date[-(1:250)],col="#B08996")
+lines(y=minES.n$ES_n,col="lightblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.n$ES_n.evt,col="olivedrab",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.n$ES_n.fhs,col="palevioletred",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.t$ES_t,col="royalblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.t$ES_t.evt,col="darkorange3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.t$ES_t.fhs,col="#F0E68C",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.skt$ES_skt,col="#227252",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.skt$ES_skt.evt,col="#B4AB2f",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.skt$ES_skt.fhs,col="darkseagreen3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=minES.emp$ES_emp,col="#CB125E",x=min_ES$date[-(1:250)],lwd=1.5)
+legend("topright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 250)
+
+###================================== mv ====================================###
+plot(y=-mv_return$value[-(1:250)]*100,type="l",ylim=c(-10,25),
+     ylab="negated log returns %",xlab="Time",main="mv: 97.5% ES",
+     x=min_ES$date[-(1:250)],lwd=1)
+lines(y=-mv.LSTM$ES,x=min_ES$date[-(1:250)],col="#B08996")
+lines(y=mv.n$ES_n,col="lightblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.n$ES_n.evt,col="olivedrab",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.n$ES_n.fhs,col="palevioletred",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.t$ES_t,col="royalblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.t$ES_t.evt,col="darkorange3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.t$ES_t.fhs,col="#F0E68C",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.skt$ES_skt,col="#227252",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.skt$ES_skt.evt,col="#B4AB2f",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.skt$ES_skt.fhs,col="darkseagreen3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=mv.emp$ES_emp,col="#CB125E",x=min_ES$date[-(1:250)],lwd=1.5)
+legend("topright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 250)
+
+###=============================== max return ================================###
+plot(y=-max_return$value[-(1:250)]*100,type="l",ylim=c(-10,25),
+     ylab="negated log returns %",xlab="Time",main="max return: 97.5% ES",
+     x=min_ES$date[-(1:250)],lwd=1)
+lines(y=-maxR.LSTM$ES,x=min_ES$date[-(1:250)],col="#B08996")
+lines(y=maxR.n$ES_n,col="lightblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.n$ES_n.evt,col="olivedrab",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.n$ES_n.fhs,col="palevioletred",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.t$ES_t,col="royalblue2",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.t$ES_t.evt,col="darkorange3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.t$ES_t.fhs,col="#F0E68C",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.skt$ES_skt,col="#227252",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.skt$ES_skt.evt,col="#B4AB2f",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.skt$ES_skt.fhs,col="darkseagreen3",x=min_ES$date[-(1:250)],lwd=1)
+lines(y=maxR.emp$ES_emp,col="#CB125E",x=min_ES$date[-(1:250)],lwd=1.5)
+legend("topright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 250)
+
+###================================= SSE ====================================###
+plot(y=-SSE.ret$return[-(1:250)],type="l",ylim=c(-10,19),
+     ylab="negated log returns %",xlab="Time",main="SSE: 97.5% ES",
+     x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=-SSE.LSTM$ES,col="#B08996",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.n$ES_n,col="lightblue2",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.n$ES_n.evt,col="olivedrab",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.n$ES_n.fhs,col="palevioletred",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.t$ES_t,col="royalblue2",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.t$ES_t.evt,col="darkorange3",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.t$ES_t.fhs,col="#F0E68C",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.skt$ES_skt,col="#227252",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.skt$ES_skt.evt,col="#B4AB2f",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.skt$ES_skt.fhs,col="darkseagreen3",x=SSE.ret$date[-(1:250)],lwd=1)
+lines(y=SSE.emp$ES_emp,col="#CB125E",x=SSE.ret$date[-(1:250)],lwd=1.5)
+legend("bottomright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 250)
+
+###================================= CBA ====================================###
+plot(y=-CBA.ret$return[-(1:250)],type="l",ylim=c(-1,1.5),
+     ylab="negated log returns %",xlab="Time",main="ChinaBond: 97.5% ES",
+     x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=-CBA.LSTM$ES,col="#B08996",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.n$ES_n,col="lightblue2",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.n$ES_n.evt,col="olivedrab",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.n$ES_n.fhs,col="palevioletred",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.t$ES_t,col="royalblue2",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.t$ES_t.evt,col="darkorange3",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.t$ES_t.fhs,col="#F0E68C",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.skt$ES_skt,col="#227252",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.skt$ES_skt.evt,col="#B4AB2f",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.skt$ES_skt.fhs,col="darkseagreen3",x=CBA.ret$date[-(1:250)],lwd=1)
+lines(y=CBA.emp$ES_emp,col="#CB125E",x=CBA.ret$date[-(1:250)],lwd=1.5)
+legend("bottomright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 250)
+
+###================================= AU99 ===================================###
+plot(y=-AU99.ret$return[-(1:250)],type="l", ylim=c(-8,13),
+     ylab="negated log returns %",xlab="Time",main="AU9999: 97.5% ES",
+     x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=-AU99.LSTM$ES,col="#B08996",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.n$ES_n,col="lightblue2",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.n$ES_n.evt,col="olivedrab",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.n$ES_n.fhs,col="palevioletred",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.t$ES_t,col="royalblue2",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.t$ES_t.evt,col="darkorange3",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.t$ES_t.fhs,col="#F0E68C",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.skt$ES_skt,col="#227252",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.skt$ES_skt.evt,col="#B4AB2f",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.skt$ES_skt.fhs,col="darkseagreen3",x=AU99.ret$date[-(1:250)],lwd=1)
+lines(y=AU99.emp$ES_emp,col="#CB125E",x=AU99.ret$date[-(1:250)],lwd=1.5)
+legend("bottomright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 250)
+
+###================================ RMB/USD =================================###
+plot(y=-RMBUSD.ret$return[-(1:250)],type="l",ylim=c(-1.5,3),
+     ylab="negated log returns %",xlab="Time",main="RMB/USD: 97.5% ES",
+     x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=-RMBUSD.LSTM$ES,col="#B08996",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.n$ES_n,col="lightblue2",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.n$ES_n.evt,col="olivedrab",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.n$ES_n.fhs,col="palevioletred",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.t$ES_t,col="royalblue2",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.t$ES_t.evt,col="darkorange3",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.t$ES_t.fhs,col="#F0E68C",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.skt$ES_skt,col="#227252",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.skt$ES_skt.evt,col="#B4AB2f",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.skt$ES_skt.fhs,col="darkseagreen3",x=RMBUSD.ret$date[-(1:250)],lwd=1)
+lines(y=RMB.emp$ES_emp,col="#CB125E",x=RMBUSD.ret$date[-(1:250)],lwd=1.5)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("#B08996","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.3,text.width = 0)
