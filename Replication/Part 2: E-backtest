@@ -1,0 +1,429 @@
+#==============================================================================#
+#                               Replicate Sec 8.1                              #
+#                             in Wang et al. (2023)                            #
+#                                   (Part 2)                                   #
+#                                                                              #
+# Quick Summary:                                                               #
+# This is the second part, where I e-backtest ES forecasts produced in part 1. #
+# The backtest starts from 2000-01-03 to 2021-12-31, as implemented in the     #
+# paper.                                                                       #
+#                                                                              #
+# Claim:                                                                       #
+# Their work is published on Github. My code is written based on my            # 
+# understanding of their paper, and is different from their code. My code      #
+# give exactly the same results.                                               #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+setwd("C:/Users/1/OneDrive/")
+install.packages("zoo")
+install.packages("xts")
+install.packages("qrmtools")
+install.packages("gt")
+install.packages("magrittr")
+
+library(tinytex)
+library(zoo)
+library(xts)
+library(rugarch)
+library(qrmtools)
+library(gt)
+library(magrittr)
+
+load("ES_n.Rdata")
+load("ES_emp.Rdata")
+load("ES_t.Rdata")
+load("ES_skt.Rdata")
+load("VaR_n.Rdata")
+load("VaR_emp.Rdata")
+load("VaR_t.Rdata")
+load("VaR_skt.Rdata")
+load("Nasdaq_Comp_nlogr.Rdata") #data name x, neg percentage log return
+
+
+#==============================================================================#
+#                                  Define Functions                            #
+#==============================================================================#
+############## Calculate (x-z)+, the non-neg difference between x,z ############
+nn_dif <- function(x,z) #x,z num
+{ 
+  d = x-z
+  if (d < 0) {
+      d = 0
+  } else {
+      d = d
+    }
+  return(d)
+} 
+
+
+########### Define model-free e-statistic for (ESp,VaRp) testing ESp ###########
+ep_ES <- function(x,r,z,p) 
+{ 
+  u = nn_dif(x,z)
+  l = (1-p)*(r-z) #z<=r
+  e = u/l
+  return(e) 
+}
+
+
+################################ e-process #####################################
+lvec = 0.975 #vector of prob levels
+N = length(x) #sample size
+w = 500 #size of moving window
+w_bet = 500 #size of moving window for empirical mean in (15)
+(n_b = N - w - w_bet) #out of sample size or size for backtest, 5536
+(stb = N - n_b + 1) #starting point for backtest, 1001
+(stl = stb - w_bet) #starting point in e-value series for lambda, 501
+
+### e(Lt,rt,zt):
+e_proc <- function(L,r,z,lvec) #L xts; r,z vector; lvec num
+{ 
+  L <- as.numeric(L) #transform xts to vector of num
+  e_process = matrix(nrow=N, ncol=length(lvec)) #same length as x
+  for (i in stl:N) #501:6536
+  {
+    e_process[i] = ep_ES(L[i],r[(i-w)],z[(i-w)],lvec)
+  }
+  return(e_process) #N by 1, 1-500 rows NA
+}
+
+### e(Lt,r,z):
+e_proc_GREL <- function(L,r,z,lvec,i) #L xts; r,z vector
+{ 
+  L <- as.numeric(L) #transform xts to vector of num
+  e_process = matrix(nrow=N, ncol=length(lvec))
+  for (j in (i-w):(i-1)) 
+    #assign values to latest 500 rows from i-1
+  {
+    e_process[j,] = ep_ES(L[j],
+                          r[(i-w_bet),],
+                          z[(i-w_bet),],
+                          lvec) 
+    #use forecasts for day i,corresponds to i-th in r,z of full length
+  }
+  return(e_process) #N by length(lvec) matrix
+}
+
+
+########################## Betting process under GREE ##########################
+l_GREE <- function(L,r,z,lvec) 
+{ 
+  GREE = matrix(nrow=N, ncol=length(lvec)) #(rs,zs)
+  m = e_proc(L,r,z,lvec) #N by 1
+  for (i in stb:N) #1001:6536
+  {
+    u = sum(m[(i-w):(i-1)])-w_bet #num
+    l = (m-1)
+    l = l^2
+    l = l[(i-w):(i-1)]
+    l = sum(l) #num
+    lambda = u/l
+    
+    if (lambda < 0) 
+    {
+      GREE[i] = 0
+    } else if (lambda > 0.5) {
+      GREE[i] = 0.5
+    } else {
+      GREE[i] = lambda
+    }
+  }
+  return(GREE) #N by 1, 1-1000 rows NA
+}
+
+
+######################### Betting process under GREL ###########################
+l_GREL <- function(L,r,z,lvec) 
+{
+  GREL <- matrix(nrow=N, ncol=length(lvec)) #(r,z)
+  for (i in stb:N) #1001:6536
+  {
+    e = e_proc_GREL(L,r,z,lvec,i)
+    l = (e-1)^2 #N by 1
+    e = e[(i-w_bet):(i-1)] #Non_NA part
+    l = l[(i-w_bet):(i-1)]
+    u = sum(e)-w_bet #num
+    l = sum(l) #1 by 1
+    lambda = u/l
+    
+    if (lambda < 0) 
+    {
+      GREL[i] = 0
+    } else if (lambda > 0.5) {
+      GREL[i] = 0.5
+    } else {
+      GREL[i] = lambda
+    }
+  }
+  return(GREL) #N by length(lvec) matrix, 1-1000 rows NA
+}
+
+
+#==============================================================================#
+#                               E-backtesting                                  #
+#==============================================================================#
+### Define function to the e-process {M(l)}t (via GREE, GREL, GREM)
+M_l <- function(L,r,z,lvec)
+{
+  e = e_proc(L,r,z,lvec)
+  lambda_GREE = l_GREE(L,r,z,lvec)
+  lambda_GREL = l_GREL(L,r,z,lvec)
+  m_E = 1 #M0=1 by def
+  m_L = 1
+  M_E = matrix(nrow=5536,ncol=length(lvec)) #by GREE
+  M_L = matrix(nrow=(5536),ncol=length(lvec)) #by GREL
+  for (i in 1258:5536) #since M0=1 (1257), start from 1258
+  { 
+    m_E_ = 1-lambda_GREE[(i+w+w_bet)]+
+              lambda_GREE[(i+w+w_bet)]*e[(i+w+w_bet)]
+    m_E = m_E*m_E_
+    M_E[i] = m_E
+    
+    m_L = m_L*(1-lambda_GREL[(i+w+w_bet),]+
+                 lambda_GREL[(i+w+w_bet),]*e[(i+w+w_bet),])
+    M_L[i,] = m_L
+  }
+  M_M = 0.5*M_E+0.5*M_L
+  return(list(M_GREE=M_E,
+              M_GREL=M_L,
+              M_GREM=M_M)) #of length 4279 non NA (1258-5536)
+}
+
+
+### Get e-process M(l) starting from 2005-01-03 to 2021-12-31
+### Derive num of days from 2000/01/03 to 2005/01/03
+(wl = length
+ (window
+   (x,start ="2000-01-03", 
+     end = "2005-01-03"))) #window length=1257 elements
+                           #1257 is the index of 2005.1.3
+                           #in the  e_process vector
+                           #M_GREE,M_GREL, M_GREM (length=6536-1000)
+
+### Over-predicted ES0.975 by 10% of the skewed-t distribution
+ES_skt_over10 <- ES_skt*1.1
+
+### Get average ES0.975 forecasts as in the 1st col in Table.6
+Avg_ES0.975_forecasts <- c(
+  paste("(",
+        round(mean(ES_n[-(1:wl)]),4),
+        ")",
+        sep=""),
+  paste("(",
+        round(mean(ES_t[-(1:wl)]),4),
+        ")",
+        sep=""),
+  paste("(",
+        round(mean(ES_skt[-(1:wl)]),4),
+        ")",
+        sep=""),
+  paste("(",
+        round(mean(ES_skt_over10[-(1:wl)]),4),
+        ")",
+        sep=""),
+  paste("(",
+        round(mean(ES_emp[-(1:wl)]),4),
+        ")",
+        sep=""))
+
+
+### by GREE
+M_GREE_n <- M_l(x, ES_n, VaR_n, lvec)$M_GREE
+M_GREE_t <- M_l(x, ES_t, VaR_t, lvec)$M_GREE
+M_GREE_skt <- M_l(x, ES_skt, VaR_skt, lvec)$M_GREE
+M_GREE_emp <- M_l(x, ES_emp, VaR_emp, lvec)$M_GREE
+M_GREE_skt_over10 <- M_l(x, ES_skt_over10, VaR_skt, lvec)$M_GREE
+
+
+### by GREL
+M_GREL_n <- M_l(x, ES_n, VaR_n, lvec)$M_GREL
+M_GREL_t <- M_l(x, ES_t, VaR_t, lvec)$M_GREL
+M_GREL_skt <- M_l(x, ES_skt, VaR_skt, lvec)$M_GREL
+M_GREL_emp <- M_l(x, ES_emp, VaR_emp, lvec)$M_GREL
+M_GREL_skt_over10 <- M_l(x, ES_skt_over10, VaR_skt, lvec)$M_GREL
+
+
+### by GREM
+M_GREM_n <- M_l(x, ES_n, VaR_n, lvec)$M_GREM
+M_GREM_t <- M_l(x, ES_t, VaR_t, lvec)$M_GREM
+M_GREM_skt <- M_l(x, ES_skt, VaR_skt, lvec)$M_GREM
+M_GREM_emp <- M_l(x, ES_emp, VaR_emp, lvec)$M_GREM
+M_GREM_skt_over10 <- M_l(x, ES_skt_over10, VaR_skt, lvec)$M_GREM
+
+
+### Summarize results in a table as in Table.6
+summary <- data.frame(
+    c("normal","t","skewed-t","st+10% ES","empirical"),
+    
+    Avg_ES0.975_forecasts,
+  
+    c(which(M_GREE_n>2)[1]-wl,
+    which(M_GREE_t>2)[1]-wl,
+    which(M_GREE_skt>2)[1]-wl,
+    which(M_GREE_skt_over10>2)[1]-wl,
+    which(M_GREE_emp>2)[1]-wl
+    ),
+    c(which(M_GREE_n>5)[1]-wl,
+    which(M_GREE_t>5)[1]-wl,
+    which(M_GREE_skt>5)[1]-wl,
+    which(M_GREE_skt_over10>5)[1]-wl,
+    which(M_GREE_emp>5)[1]-wl
+  ),
+    c(which(M_GREE_n>10)[1]-wl,
+    which(M_GREE_t>10)[1]-wl,
+    which(M_GREE_skt>10)[1]-wl,
+    which(M_GREE_skt_over10>10)[1]-wl,
+    which(M_GREE_emp>10)[1]-wl
+  ),
+  
+    c(which(M_GREL_n>2)[1]-wl,
+    which(M_GREL_t>2)[1]-wl,
+    which(M_GREL_skt>2)[1]-wl,
+    which(M_GREL_skt_over10>2)[1]-wl,
+    which(M_GREL_emp>2)[1]-wl
+  ),
+    c(which(M_GREL_n>5)[1]-wl,
+    which(M_GREL_t>5)[1]-wl,
+    which(M_GREL_skt>5)[1]-wl,
+    which(M_GREL_skt_over10>5)[1]-wl,
+    which(M_GREL_emp>5)[1]-wl
+  ),
+    c(which(M_GREL_n>10)[1]-wl,
+    which(M_GREL_t>10)[1]-wl,
+    which(M_GREL_skt>10)[1]-wl,
+    which(M_GREL_skt_over10>10)[1]-wl,
+    which(M_GREL_emp>10)[1]-wl
+  ),
+  
+    c(which(M_GREM_n>2)[1]-wl,
+    which(M_GREM_t>2)[1]-wl,
+    which(M_GREM_skt>2)[1]-wl,
+    which(M_GREM_skt_over10>2)[1]-wl,
+    which(M_GREM_emp>2)[1]-wl
+  ),
+    c(which(M_GREM_n>5)[1]-wl,
+    which(M_GREM_t>5)[1]-wl,
+    which(M_GREM_skt>5)[1]-wl,
+    which(M_GREM_skt_over10>5)[1]-wl,
+    which(M_GREM_emp>5)[1]-wl
+  ),
+    c(which(M_GREM_n>10)[1]-wl,
+    which(M_GREM_t>10)[1]-wl,
+    which(M_GREM_skt>10)[1]-wl,
+    which(M_GREM_skt_over10>10)[1]-wl,
+    which(M_GREM_emp>10)[1]-wl
+  ))
+names(summary) <- c("threshold","a","b","c","d","e",
+                    "f","g","h","i","j")
+
+
+### Produce table by package gt
+summary %>%
+  gt() %>%
+  tab_spanner(.,
+            label = "GREE",
+            columns = 3:5) %>%
+  tab_spanner(.,
+            label = "GREL",
+            columns = 6:8) %>%
+  tab_spanner(.,
+            label = "GREM",
+            columns = 9:11) %>%
+  cols_label(.,
+             a=" ",
+             b="2",c="5",d="10",
+             e="2",f="5",g="10",
+             h="2",i="5",j="10",
+             )
+  
+
+### Make plots of log-transformed e-process from 2005/01/03
+### GREE
+log_n <- log(M_GREE_n)[-(1:wl)]
+plot(index(x)[-(1:(wl+1000))],log_n,type="l",
+     ylim=c(-1,5),
+     xlab="dates",ylab="eprocess via GREE",
+     col="#FFB90F") #Normal
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREE_t)[-(1:wl)],
+      col="#66CD00") #t
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREE_skt)[-(1:wl)],
+      col="#5CACEE") #skt
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREE_emp)[-(1:wl)],
+      col="#EE3A8C") #emp
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREE_skt_over10)[-(1:wl)]) #overPredict
+abline(h=log(2),lwd=1,lty=2)
+abline(h=log(5),lwd=1,lty=2)
+abline(h=log(10),lwd=1,lty=2)
+
+legend("topright",
+       legend = c("norm","t","skewed-t","empirical",
+                  "st+10%ES"),
+       lty = c(1,1,1,1,1),
+       col = c("#FFB90F","#66CD00","#5CACEE","#EE3A8C",
+               "black"),
+       cex = 0.3)
+
+
+### GREL
+log_n <- log(M_GREL_n)[-(1:wl)]
+plot(index(x)[-(1:(wl+1000))],log_n,type="l",
+     ylim=c(-1,5),
+     xlab="dates",ylab="eprocess via GREL",
+     col="#FFB90F") #Normal
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREL_t)[-(1:wl)],
+      col="#66CD00") #t
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREL_skt)[-(1:wl)],
+      col="#5CACEE") #skt
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREL_emp)[-(1:wl)],
+      col="#EE3A8C") #emp
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREL_skt_over10)[-(1:wl)]) #overPredict
+abline(h=log(2),lwd=1,lty=2)
+abline(h=log(5),lwd=1,lty=2)
+abline(h=log(10),lwd=1,lty=2)
+legend("topleft",
+       legend = c("norm","t","skewed-t","empirical",
+                  "st+10%ES"),
+       lty = c(1,1,1,1,1),
+       col = c("#FFB90F","#66CD00","#5CACEE","#EE3A8C",
+               "black"),
+       cex = 0.3)
+
+
+### GREM
+log_n <- log(M_GREM_n)[-(1:wl)]
+plot(index(x)[-(1:(wl+1000))],log_n,type="l",
+     ylim=c(-1,5),
+     xlab="dates",ylab="eprocess via GREM",
+     col="#FFB90F") #Normal
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREM_t)[-(1:wl)],
+      col="#66CD00") #t
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREM_skt)[-(1:wl)],
+      col="#5CACEE") #skt
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREM_emp)[-(1:wl)],
+      col="#EE3A8C") #emp
+lines(index(x)[-(1:(wl+1000))],
+      log(M_GREM_skt_over10)[-(1:wl)]) #overPredict
+abline(h=log(2),lwd=1,lty=2)
+abline(h=log(5),lwd=1,lty=2)
+abline(h=log(10),lwd=1,lty=2)
+legend("topleft",
+       legend = c("norm","t","skewed-t","empirical",
+                  "st+10%ES"),
+       lty = c(1,1,1,1,1),
+       col = c("#FFB90F","#66CD00","#5CACEE","#EE3A8C",
+               "black"),
+       cex = 0.3)
+
