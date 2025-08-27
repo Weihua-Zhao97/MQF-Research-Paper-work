@@ -1,1 +1,302 @@
+#==============================================================================#
+#                               Replicate Sec 8.1                              #
+#                             in Wang et al. (2023)                            #
+#                                   (Part 1)                                   #
+#                                                                              #
+# Quick Summary:                                                               #
+# My research paper focused on using the e-backtesting method proposed in      #
+# Wang et al. (2023) to evaluate popular ES forecasting models. In order to    #
+# confirm that I understand their approach correctly, below I replicate the    #
+# results presented in Sec 8.1 of their paper:                                 #
+# [Q. Wang, R. Wang, and J. F. Ziegel. E-backtesting. Preprint, arXiv:         # 
+# 2209.00991v3, 2023. ].                                                       #
+# This is the first part, where I prepare ES and VaR forecasts on the Nasdaq   # 
+# Composite dataset (from 1996-01-16 to 2021-12-31), as in their paper.        #
+#                                                                              #
+# Claim:                                                                       #
+# Their work is published on Github. My code is written based on my            # 
+# understanding of their paper, and is different from their code. My code      #
+# produce exactly the same results.                                            #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+### Packages
+setwd("C:/Users/1/OneDrive/")
+install.packages("zoo")
+install.packages("xts")
+install.packages("qrmtools")
+install.packages("tseries")
+install.packages("fGarch")
+install.packages("skewt")
+install.packages("sgt")
+install.packages("betategarch")
+library(zoo)
+library(xts)
+library(rugarch)
+library(qrmtools)
+library(tseries)
+library(fGarch)
+library(skewt)
+library(sgt)
+library(betategarch)
+
+### Data
+y <- get_data("^IXIC",from="1996-01-16",to="2022-01-03",src="yahoo")
+
+Nasdaq_Comp <- read.csv(file="C:/Users/1/OneDrive/Nasdaq_Comp.csv")
+Nasdaq_Comp$date <- as.Date(Nasdaq_Comp$date) #transform char to date
+Nasdaq_Comp$closing <- as.numeric(Nasdaq_Comp$closing) #char to num
+Nasdaq_Comp <- 
+  xts(Nasdaq_Comp$closing, Nasdaq_Comp$date) #Nasdaq Composite xts object
+
+x <- -returns(y)*100 #neg percentage log-returns to be used
+
+save(Nasdaq_Comp, file = "Nasdaq_Comp_xts.Rdata")
+save(x, file = "Nasdaq_Comp_nlogr.Rdata")
+
+#==============================================================================#
+#                      Data analysis: check if stationary                      #
+#==============================================================================#
+### visually
+plot.zoo(x, xlab="dates",ylab="negated 
+         percentage log returns") #conditional mean fluctuates around 0
+acf(x) #little serial correlation at non-zero lags
+### ADF test
+(adf.test(x)) #p<0.05,reject H0,stationary
+
+#==============================================================================#
+#                                 Produce forecasts                            #
+#==============================================================================#
+### Initial Setting ###
+N = length(x) #sample size
+w = 500 #size of moving window
+w_bet = 500 #size of moving window for empirical mean in (15)
+(n_b = N - w - w_bet) #out of sample size, or sample size for backtesting
+lvec = 0.975 #vector of levels for (ES_l,VaR_l) testing ES
+
+ES_n <- matrix(nrow=(N-w),ncol=length(lvec)) #ES forecast matrix by Normal
+ES_t <- matrix(nrow=(N-w),ncol=length(lvec)) #by t
+ES_skt <- matrix(nrow=(N-w),ncol=length(lvec)) #by skewed t
+ES_emp <- matrix(nrow=(N-w),ncol=length(lvec)) #ES empirical forecasts
+
+VaR_n <- matrix(nrow=(N-w),ncol=length(lvec)) #VaR forecast matrix by Normal
+VaR_t <- matrix(nrow=(N-w),ncol=length(lvec)) #by t
+VaR_skt <- matrix(nrow=(N-w),ncol=length(lvec)) #by skewed t
+VaR_emp <- matrix(nrow=(N-w),ncol=length(lvec)) #VaR empirical forecasts
+
+mut_n <- vector(mode="numeric",length=N-w) #cond_mean est vector by Normal
+sigt_n <- vector(mode="numeric",length=N-w) #cond_sig est vector by Normal
+mut_t <- vector(mode="numeric",length=N-w) #cond_mean est vector by t
+sigt_t <- vector(mode="numeric",length=N-w) #cond_sig est vector by t
+mut_skt <- vector(mode="numeric",length=N-w) #cond_mean est vector by skt
+sigt_skt <- vector(mode="numeric",length=N-w) #cond_sig est vector by skt
+
+
+### 1-day-ahead ES forecast function ###
+ES.forecasts <- function(fit, l, qmodel, esmodel,subdat)
+{
+  frcst = ugarchforecast(fit,n.ahead=1)
+  sigt1 = sigma(frcst)
+  mut1 = fitted(frcst)
+  VaR.model = mut1 + sigt1*qmodel
+  es.model = mut1 + sigt1*esmodel #parametric model forecast
+  
+  subdat = as.numeric(subdat)
+  qEmp = quantile(subdat,l)
+  esEmp = NULL
+  for (i in 1:length(l))
+    esEmp = c(esEmp, mean(subdat[subdat >= qEmp[i]])) #empirical forecast
+  
+  return(list(ESmodel=es.model,
+              VaRmodel = VaR.model,
+              mut=mut1,
+              sigt=sigt1,
+              VaREmpirical=qEmp,
+              ESEmpirical=esEmp))
+}
+
+
+### Risk forecast: Normal and Empirical ###
+spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                  distribution.model="norm") #model specification
+
+qmodel = qdist("norm",p=lvec, mu=0, sigma=1) #VaR_0.975 of N(0,1)
+
+esmodel = NULL
+for (i in 1:length(lvec)) 
+{
+  esmodel = c(esmodel,
+              ((ddist("norm",qdist("norm",p=lvec,mu=0,sigma=1),mu=0,sigma=1))/
+                (1-lvec))
+              )  #ES_0.975 of N(0,1)
+}
+
+for (i in 1:(N-w))
+{
+  fit = ugarchfit(spec, x[i:(i+w-1)],solver="hybrid")
+  foc = ES.forecasts(fit=fit,
+                     l=lvec,
+                     qmodel=qmodel,
+                     esmodel=esmodel,
+                     subdat=x[i:(i+w-1)])
+  ES_n[i,] = foc$ESmodel
+  VaR_n[i,] = foc$VaRmodel
+  mut_n[i] = foc$mut
+  sigt_n[i] = foc$sigt
+  ES_emp[i,] = foc$ESEmpirical
+  VaR_emp[i,] = foc$VaREmpirical
+}  
+
+save(ES_n, file = "ES_n.Rdata")
+save(ES_emp, file = "ES_emp.Rdata")
+save(VaR_n, file = "VaR_n.Rdata")
+save(VaR_emp, file = "VaR_emp.Rdata")
+
+
+
+### Risk forecast: t ###
+spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                  distribution.model="std") #model specification
+
+for (i in 1:(N-w))
+{
+  fit = ugarchfit(spec, x[i:(i+w-1)],solver="hybrid")
+  df_t = coef(fit)["shape"]
+  qmodel = qt(p=lvec,df=df_t)
+  
+  esmodel = NULL
+  for (j in 1:length(lvec)) {
+    esmodel = c(esmodel,
+                integrate(function(x) x*dt(x,df=df_t),
+                          qmodel[j],Inf)$value
+                /(1-lvec[j])) #ES_0.975 t
+  }
+  
+  qmodel = qmodel * sqrt((df_t-2)/df_t)
+  esmodel = esmodel * sqrt((df_t-2)/df_t) #adjust to have mean 0,var 1
+  
+  foc = ES.forecasts(fit=fit,
+                     l=lvec,
+                     qmodel=qmodel,
+                     esmodel=esmodel,
+                     subdat=x[i:(i+w-1)])
+  ES_t[i,] = foc$ESmodel
+  VaR_t[i,] = foc$VaRmodel
+  mut_t[i] = foc$mut
+  sigt_t[i] = foc$sigt
+}  
+save(ES_t, file = "ES_t.Rdata")
+save(VaR_t, file = "VaR_t.Rdata")
+
+
+
+### Risk forecast: skewed-t ###
+spec = ugarchspec(mean.model=list(armaOrder=c(1,0),include.mean=T),
+                  distribution.model="sstd") #model specification
+
+for (i in 1:(N-w))
+{
+  fit = ugarchfit(spec, x[i:(i+w-1)],solver="hybrid")
+  nu = coef(fit)["shape"]
+  ga = coef(fit)["skew"]
+  
+  #qmodel = qskt(p=lvec,df=df_skt,gamma=ga)
+  #esmodel = NULL
+  #for (j in 1:length(lvec)){
+    #esmodel = c(esmodel,
+                #integrate(function(x) x*dskt(x,df=df_skt,gamma=ga),
+                          #qmodel[j],Inf)$value
+                #/(1-lvec[j])) #ES_0.975 skt
+  #}
+  #qmodel = (qmodel-STmean(df=df_skt,skew=ga))/
+    #sqrt(STvar(df=df_skt,skew=ga))
+  #esmodel = (esmodel-STmean(df=df_skt,skew=ga))/
+    #sqrt(STvar(df=df_skt,skew=ga)) #adjust to have mean 0,var 1
+  
+  #===================================================================#
+  # Use the forecasts in Appendix B.4 in (Patton el al 2019)
+  qmodel = qsgt(lvec,mu=0,sigma=1,lambda=(ga^2-1)/(ga^2+1),p=2,q=nu/2)
+  
+  esmodel = NULL # expected shortfall for the assumed model/distribution
+  
+  # parameters of Hansen (1994)
+  lam = -(ga^2-1)/(ga^2+1) 
+  c = gamma((nu+1)/2) / (gamma(nu/2) * sqrt(pi * (nu-2)))
+  a = 4*lam*c*(nu-2)/(nu-1)
+  b = sqrt(1+3*lam^2-a^2)
+  
+  # Calculate explicit ES for skewed-t described in Patton et al. (2019)
+  for(j in length(lvec)){
+    # We make some transformation here because we are handling loss data
+    if(qmodel[j] >= (a/b)){
+      alpha_tilde1 = psgt(b/(1-lam)*
+                            (-qmodel[j]+a/b),mu=0,sigma=1,lambda=0,p=2,q=nu/2)
+      es_t1 = sqrt((nu-2)/nu) * nu^(nu/2)/
+        (2*(alpha_tilde1)*sqrt(pi))*
+        gamma((nu-1)/2)/gamma(nu/2)*
+        (qt(1-alpha_tilde1, df=nu)^2+nu)^((1-nu)/2) # ES for standardized t
+      esmodel = c(esmodel, 
+                  -(alpha_tilde1)/(1-lvec[j])
+                  * (1-lam) * (-a/b - (1-lam)/b*es_t1))
+    }else{
+      lam2 = -lam
+      ga2 = 1/ga
+      nu2 = nu
+      c2 = c
+      a2 = 4*lam2*c2*(nu2-2)/(nu2-1)
+      b2 = b
+      alpha_tilde2 = psgt(b2/(1-lam2)*
+                            (qsgt(lvec[j],mu=0,sigma=1,
+                                  lambda=lam2,p=2,q=nu2/2)+a2/b2),
+                          mu=0,
+                          sigma=1,
+                          lambda=0,
+                          p=2,
+                          q=nu2/2)
+      es_t2 = sqrt((nu2-2)/nu2) * nu2^(nu2/2)/
+        (2*(alpha_tilde2)*sqrt(pi))*
+        gamma((nu2-1)/2)/gamma(nu2/2)*
+        (qt(1-alpha_tilde2, df=nu2)^2+nu2)^((1-nu2)/2)
+      esmodel = c(esmodel, 
+                  -(alpha_tilde2)/(1-lvec[j]) 
+                  * (1-lam2) * 
+                    (-a2/b2 - (1-lam2)/b2*es_t2))
+    }
+  }
+  
+  foc = ES.forecasts(fit=fit,
+                     l=lvec,
+                     qmodel=qmodel,
+                     esmodel=esmodel,
+                     subdat=x[i:(i+w-1)])
+  ES_skt[i,] = foc$ESmodel
+  VaR_skt[i,] = foc$VaRmodel
+  mut_skt[i] = foc$mut
+  sigt_skt[i] = foc$sigt
+}  
+
+save(ES_skt, file = "ES_skt.Rdata")
+save(VaR_skt, file = "VaR_skt.Rdata")
+
+#==============================================================================#
+#                                  Make Plots                                  #
+#==============================================================================#
+plot(index(x)[-(1:1000)],ES_n[-(1:500)],type="l",ylim=c(1.2,10),
+     xlab="dates", ylab="ES forecast",col="#FFB90F") #plot from 1001th obs
+
+lines(index(x)[-(1:1000)],ES_t[-(1:500)],
+      col="#66CD00")
+
+lines(index(x)[-(1:1000)],ES_skt[-(1:500)],
+      lty=3,col="#5CACEE")
+
+lines(index(x)[-(1:1000)],ES_emp[-(1:500)],col="#EE3A8C")
+
+legend("topleft", inset = c(0.12,0),
+       legend = c("norm","t","skewed-t","empirical"),
+       lwd = c(1,1,1,2),
+       lty = c(1,1,3,1),
+       col = c("#FFB90F","#66CD00","#5CACEE","#EE3A8C"),
+       cex = 0.3)
 
