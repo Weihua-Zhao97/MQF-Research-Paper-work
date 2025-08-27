@@ -1,0 +1,535 @@
+#==============================================================================#
+#      Optimize the portfolio of 22 stocks (selected from China A shares)      #
+#                               using 4 strategies                             #
+#                                                                              #
+#  Quick summary:                                                              #
+#  Similar to the portfolio setup in Wang et al. (2023), for each of the 11    #
+#  industries in the Global Industry Classification Standard (GICS), I pick    #
+#  two stocks from China A-shares with the largest market capitalization as of # 
+#  year-end 2021, and construct portfolios using four strategies: naïve 1/N,   #
+#  minimizing ES, maximizing return, and Markowitz mean-variance model.        #
+#  Weight vector is updated daily for each strategy, with that of naïve 1/N    #
+#  being rebalanced to 1/22 on the last trading day of each year and that of   #
+#  others being estimated using the most recent 250 observations.              #
+#  For all strategies excluding the naïve 1/N, expected return at each day     # 
+#  is estimated by the CH-4-factor model proposed in Liu et al. (2019), using  # 
+#  the most recent 250-day prices, and daily factor values in the model are    #
+#  directly downloaded from Prof. Robert F. Stambaugh’s website:               #
+#  https://finance.wharton.upenn.edu/~stambaug/.                               #
+#                                                                              #
+# 1. Naïve 1/N (naive):                                                        #
+#    This refers to the rule in which the fraction 1/N of wealth is allocated  # 
+#    to each of the N assets available for investment at each rebalancing date #
+#    (DeMiguel et al., 2009). I perform this strategy with the initial wealth  #
+#    assumed to be one and rebalance the weight to 1/22 at the last trading    #
+#    day of each year.                                                         #
+#                                                                              #
+# 2. minimizing ES (min_ES):                                                   #
+#    This refers to the portfolio that minimizes the estimated ES exposure     #
+#    subject to a minimum required return 𝜇, using the dual representation of # 
+#    ES based on VaR as proposed in Rockafellar and Uryasev (2002). I set 𝜇   #
+#    as the average of past 250-day realized returns of the naïve portfolio.   #
+#                                                                              #
+# 3. maximizing return (max_R):                                                #
+#    Similar to 2, this refers to the portfolio that maximizes the estimated   #
+#    expected return subject to a maximum ES tolerance 𝛾. I set 𝛾 as the     #
+#    average of the past 250-day empirical ES estimates of the naïve portfolio.#
+#                                                                              #
+# 4. Markowitz mean-variance (MV):                                             #
+#    I estimate the covariance matrix 𝛴 for each day by the empirical         # 
+#    covariance matrix of past 250-day returns.                                #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+setwd("C:/Users/1/OneDrive/桌面/portfolio")
+library(lubridate)
+library(lpSolve)
+library(quadprog)
+library(Matrix)
+library(ggstream)
+library(ggplot2)
+
+#==============================================================================#
+#                                 Data Prep                                    #
+#==============================================================================#
+portfolio <- read.csv("CHportfolio.csv")
+portfolio$Date <- as.Date(portfolio$Date) #transform char to date
+
+GZMT <- as.numeric(portfolio$X600519)
+WLY <- as.numeric(portfolio$X000858)
+JDF <- as.numeric(portfolio$X000725)
+SAGD <- as.numeric(portfolio$X600703)
+GTDL <- as.numeric(portfolio$X600886)
+GDDL <- as.numeric(portfolio$X600795)
+HRYY <- as.numeric(portfolio$X600276)
+YNBY <- as.numeric(portfolio$X000538)
+WHHX <- as.numeric(portfolio$X600309)
+BGGF <- as.numeric(portfolio$X600019)
+GL <- as.numeric(portfolio$X000651)
+SQ <- as.numeric(portfolio$X600104)
+ZHSF <- as.numeric(portfolio$X600760)
+ZGCB <- as.numeric(portfolio$X600150)
+WK <- as.numeric(portfolio$X000002)
+LDKG <- as.numeric(portfolio$X600606)
+ZGSH <- as.numeric(portfolio$X600028)
+HLSH <- as.numeric(portfolio$X600346)
+WTKJ <- as.numeric(portfolio$X600745)
+ZXTX <- as.numeric(portfolio$X000063)
+PAYH <- as.numeric(portfolio$X000001)
+PFYH <- as.numeric(portfolio$X600000)
+
+P = cbind(GZMT, WLY, JDF, SAGD, GTDL, GDDL, HRYY, YNBY, WHHX, BGGF, GL,
+          SQ, ZHSF, ZGCB, WK, LDKG, ZGSH, HLSH, WTKJ, ZXTX, PAYH, PFYH) #matrix
+P_hat = matrix(NA,(nrow(P)-1),ncol(P)) #log returns
+for (i in 2:nrow(P)) {P_hat[(i-1),]=P[i,]/P[(i-1),]}
+P_hat = log(P_hat)
+
+rf = as.numeric(portfolio$rf_dly)   
+MKT = as.numeric(portfolio$mktrf)
+VMG = as.numeric(portfolio$VMG)
+SMB = as.numeric(portfolio$SMB)
+PMO = as.numeric(portfolio$PMO)
+
+#==============================================================================#
+#                           Get daily expected returns                         #
+#                      by CH4-factor model (Liu et al., 2019)                  #                                
+#==============================================================================#
+n = nrow(P_hat) #time
+m = ncol(P_hat) #stocks
+Exp_mu = matrix(NA, nrow = 4688, ncol = m)
+for (j in 1:m)
+{
+  for (i in (1:4688)) #=n-250+1-1
+  { 
+    y = P_hat[i:(i-1+250),j]-rf[i:(i-1+250)]
+    x3 = MKT[i:(i-1+250)]
+    x2 = VMG[i:(i-1+250)]
+    x1 = SMB[i:(i-1+250)]
+    x4 = PMO[i:(i-1+250)]
+    fit = lm(y~x1+x2+x3+x4)
+    result = predict(fit, data.frame(x1=SMB[(i+250)],
+                                     x2=VMG[(i+250)],
+                                     x3=MKT[(i+250)],
+                                     x4=PMO[(i+250)]))
+    Exp_mu[i,j] = as.numeric(result)+rf[(i+250)]
+  }
+}
+save(Exp_mu, file = "Expected_Return.Rdata")
+
+#==============================================================================#
+#                            Naive 1/N strategy                                #
+#==============================================================================#
+reblance_1 = subset(portfolio, year(Date)<=2001)
+reblance_2 = subset(portfolio, year(Date)>2001 & year(Date)<=2002)
+reblance_3 = subset(portfolio, year(Date)>2002 & year(Date)<=2003)
+reblance_4 = subset(portfolio, year(Date)>2003 & year(Date)<=2004)
+reblance_5 = subset(portfolio, year(Date)>2004 & year(Date)<=2005)
+reblance_6 = subset(portfolio, year(Date)>2005 & year(Date)<=2006)
+reblance_7 = subset(portfolio, year(Date)>2006 & year(Date)<=2007)
+reblance_8 = subset(portfolio, year(Date)>2007 & year(Date)<=2008)
+reblance_9 = subset(portfolio, year(Date)>2008 & year(Date)<=2009)
+reblance_10 = subset(portfolio, year(Date)>2009 & year(Date)<=2010)
+reblance_11 = subset(portfolio, year(Date)>2010 & year(Date)<=2011)
+reblance_12 = subset(portfolio, year(Date)>2011 & year(Date)<=2012)
+reblance_13 = subset(portfolio, year(Date)>2012 & year(Date)<=2013)
+reblance_14 = subset(portfolio, year(Date)>2013 & year(Date)<=2014)
+reblance_15 = subset(portfolio, year(Date)>2014 & year(Date)<=2015)
+reblance_16 = subset(portfolio, year(Date)>2015 & year(Date)<=2016)
+reblance_17 = subset(portfolio, year(Date)>2016 & year(Date)<=2017)
+reblance_18 = subset(portfolio, year(Date)>2017 & year(Date)<=2018)
+reblance_19 = subset(portfolio, year(Date)>2018 & year(Date)<=2019)
+reblance_20 = subset(portfolio, year(Date)>2019 & year(Date)<=2020)
+reblance_21 = subset(portfolio, year(Date)>2020 & year(Date)<=2021)
+
+naive <- function(data, initial, isfirst, last) {
+  if (isfirst == T) {#initial wealth=1/n(s1+...+s22)
+    data = as.matrix(data[,2:23])
+    n = nrow(data)
+    m = ncol(data) #m=22
+    value = matrix(NA,n,1)
+    weight = matrix(NA,n,22)
+    value[1] = initial
+    w = initial/m #initial wealth in each stock
+    weight[1,] = rep(1/22,22)
+    for (i in 2:n)
+      {
+      w = w*data[i,]/data[(i-1),]
+      weight[i,] = w/sum(w)
+      value[i] = sum(w)
+      }  
+    } else {
+      data = as.matrix(data[,2:23])
+      last = tail(last,1) #use the last data set (last row)
+      last = as.numeric(last[,2:23])
+      n = nrow(data)
+      m = ncol(data) #m=22
+      value = matrix(NA,n,1)
+      weight = matrix(NA,n,22)
+      w = initial/m #wealth invested in each stock
+      weight[1,] = rep(1/22,22)
+      w = w*data[1,]/last
+      value[1] = sum(w)
+      for (i in 2:n)
+        {
+        w = w*data[i,]/data[(i-1),]
+        weight[i,] = w/sum(w)
+        value[i] = sum(w)
+        }
+    }
+  return(list(v=value,w=weight))
+}
+
+v1 = naive(reblance_1,mean(P[1,]),T, NULL)$v
+v2 = naive(reblance_2,tail(v1,1),F, reblance_1)$v
+v3 = naive(reblance_3,tail(v2,1),F, reblance_2)$v
+v4 = naive(reblance_4,tail(v3,1),F, reblance_3)$v
+v5 = naive(reblance_5,tail(v4,1),F, reblance_4)$v
+v6 = naive(reblance_6,tail(v5,1),F, reblance_5)$v
+v7 = naive(reblance_7,tail(v6,1),F, reblance_6)$v
+v8 = naive(reblance_8,tail(v7,1),F, reblance_7)$v
+v9 = naive(reblance_9,tail(v8,1),F, reblance_8)$v
+v10 = naive(reblance_10,tail(v9,1),F, reblance_9)$v
+v11 = naive(reblance_11,tail(v10,1),F, reblance_10)$v
+v12 = naive(reblance_12,tail(v11,1),F, reblance_11)$v
+v13 = naive(reblance_13,tail(v12,1),F, reblance_12)$v
+v14 = naive(reblance_14,tail(v13,1),F, reblance_13)$v
+v15 = naive(reblance_15,tail(v14,1),F, reblance_14)$v
+v16 = naive(reblance_16,tail(v15,1),F, reblance_15)$v
+v17 = naive(reblance_17,tail(v16,1),F, reblance_16)$v
+v18 = naive(reblance_18,tail(v17,1),F, reblance_17)$v
+v19 = naive(reblance_19,tail(v18,1),F, reblance_18)$v
+v20 = naive(reblance_20,tail(v19,1),F, reblance_19)$v
+v21 = naive(reblance_21,tail(v20,1),F, reblance_20)$v
+naive_portfolio = c(v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,
+                    v13,v14,v15,v16,v17,v18,v19,v20,v21)
+naive_portfolio = data.frame(Date=portfolio$Date,
+                             Value=naive_portfolio)
+save(naive_portfolio, file = "naive_portfolio.Rdata")
+naive_return = log(naive_portfolio$Value[-1]/naive_portfolio$Value[-4939])
+
+w1 = naive(reblance_1,mean(P[1,]),T, NULL)$w
+w2 = naive(reblance_2,tail(v1,1),F, reblance_1)$w
+w3 = naive(reblance_3,tail(v2,1),F, reblance_2)$w
+w4 = naive(reblance_4,tail(v3,1),F, reblance_3)$w
+w5 = naive(reblance_5,tail(v4,1),F, reblance_4)$w
+w6 = naive(reblance_6,tail(v5,1),F, reblance_5)$w
+w7 = naive(reblance_7,tail(v6,1),F, reblance_6)$w
+w8 = naive(reblance_8,tail(v7,1),F, reblance_7)$w
+w9 = naive(reblance_9,tail(v8,1),F, reblance_8)$w
+w10 = naive(reblance_10,tail(v9,1),F, reblance_9)$w
+w11 = naive(reblance_11,tail(v10,1),F, reblance_10)$w
+w12 = naive(reblance_12,tail(v11,1),F, reblance_11)$w
+w13 = naive(reblance_13,tail(v12,1),F, reblance_12)$w
+w14 = naive(reblance_14,tail(v13,1),F, reblance_13)$w
+w15 = naive(reblance_15,tail(v14,1),F, reblance_14)$w
+w16 = naive(reblance_16,tail(v15,1),F, reblance_15)$w
+w17 = naive(reblance_17,tail(v16,1),F, reblance_16)$w
+w18 = naive(reblance_18,tail(v17,1),F, reblance_17)$w
+w19 = naive(reblance_19,tail(v18,1),F, reblance_18)$w
+w20 = naive(reblance_20,tail(v19,1),F, reblance_19)$w
+w21 = naive(reblance_21,tail(v20,1),F, reblance_20)$w
+naive_weight = rbind(w1,w2,w3,w4,w5,w6,w7,w8,w9,w10,w11,w12,
+                        w13,w14,w15,w16,w17,w18,w19,w20,w21)
+save(naive_weight, file = "naive_w.Rdata")
+
+################################################################################
+name = names(portfolio)[2:23]
+stock = NULL
+for (i in 1:22) {stock=c(stock,substring(name[i],2))} #get the stock tickers
+################################################################################
+date=portfolio$Date[-(1:251)]
+df <- data.frame(date=as.Date(character()),
+                 weight=numeric(),
+                 stock=character()) 
+for (i in 1:22) {
+  d = data.frame(date=date, weight=naive_weight[-(1:251),i],
+                 stocks=rep(stock[i],length(date)))
+  df = rbind(df, d) #df is used for weights plots
+}
+df3=df
+
+#==============================================================================#
+#                              Min ES Portfolio                                #
+#==============================================================================#
+weight = matrix(NA,4688,22)
+a = 0.975
+for (t in 251:4938)
+{ 
+  obj <- c(1, rep((1/(1-a)/250), 250), rep(0,22))
+  mat <- rbind(c(0,rep(0,250),rep(1,22)),
+               cbind(rep(1,250),diag(250),P_hat[(t-250):(t-1),]),
+               c(0,rep(0,250),Exp_mu[(t-250),]),
+               cbind(rep(0,22),matrix(0,22,250),diag(22))
+               )
+  dir <- c("==",rep(">=",251),rep("<",22))
+  naive_mu = as.numeric(naive_return)[(t-250):(t-1)]
+  rhs <- c(1,rep(0,250),mean(naive_mu),rep(1,22))
+  solve <- lp("min",obj,mat,dir,rhs)
+  weight[(t-250),] = solve$solution[252:273]
+  if (t %% 100 == 0) {print(t)}
+}
+
+################################################################################
+name = names(portfolio)[2:23]
+stock = NULL
+for (i in 1:22) {stock=c(stock,substring(name[i],2))} #get the stock tickers
+################################################################################
+date=portfolio$Date[-(1:251)]
+df <- data.frame(date=as.Date(character()),
+                 weight=numeric(),
+                 stock=character()) 
+for (i in 1:22) {
+  d = data.frame(date=date, weight=weight[,i],stocks=rep(stock[i],length(date)))
+  df = rbind(df, d) #df is used for weights plots
+}
+df1=df
+save(weight, file = "min_ES_w.Rdata")
+################################################################################
+min_ES = data.frame(date=portfolio$Date[-(1:251)],
+                    value=diag(weight %*% t(P_hat[251:4938,])))
+save(min_ES, file = "min_ES.Rdata")
+
+
+#==============================================================================#
+#                            Max Return Portfolio                              #
+#==============================================================================#
+weight = matrix(NA,4688,22)
+a = 0.975
+for (t in 251:4938)
+{ 
+  obj <- c(0,rep(0,250),Exp_mu[(t-250),])
+  mat <- rbind(c(0,rep(0,250),rep(1,22)),
+               cbind(rep(1,250),diag(250),P_hat[(t-250):(t-1),]),
+               c(1, rep((1/(1-a)/250), 250), rep(0,22)),
+               cbind(rep(0,22),matrix(0,22,250),diag(22))
+  )
+  dir <- c("==",rep(">=",250),"<=", rep("<",22))
+  
+  value = log(naive_portfolio$Value[-1]/naive_portfolio$Value[-4938])
+  naive_mu = as.numeric(-value)[(t-250):(t-1)]
+  
+  qEmp = quantile(naive_mu,a)
+  esEmp = mean(naive_mu[naive_mu >= qEmp])
+  
+  rhs <- c(1,rep(0,250),esEmp,rep(1,22))
+  solve <- lp("max",obj,mat,dir,rhs)
+  weight[(t-250),] = solve$solution[252:273]
+  if (t %% 100 == 0) {print(t)}
+}
+
+################################################################################
+date=portfolio$Date[-(1:251)]
+df <- data.frame(date=as.Date(character()),
+                 weight=numeric(),
+                 stock=character()) 
+for (i in 1:22) {
+  d = data.frame(date=date, weight=weight[,i],stocks=rep(stock[i],length(date)))
+  df = rbind(df, d) #df is used for weights plots
+}
+df2=df
+save(weight, file = "max_R_w.Rdata")
+################################################################################
+max_return = data.frame(date=portfolio$Date[-(1:251)],
+                        value=diag(weight %*% t(P_hat[251:4938,])))
+save(max_return, file = "max_return.Rdata")
+
+
+#==============================================================================#
+#                            Mean-Variance Portfolio                           #
+#==============================================================================#
+# Solve optimal weights with constrained optimization
+w = matrix(NA,4688,22)
+for (t in 251:4938) {
+  Dmat = cov(P[(t-250):(t-1),])
+  Dmat = nearPD(cov(Dmat))$mat
+  dvec = Exp_mu[(t-250),]
+  Amat = t(rbind(rep(1,22),diag(22)))
+  bvec = c(1,rep(0,22))
+  qp <- solve.QP(Dmat, dvec, Amat, bvec, meq = 1,factorized=F)
+  weight = qp$solution
+  w[(t-250),] = weight
+  if (t %% 100 == 0) {print(t)}
+}
+w = round(w,8)
+w = w/apply(w,1,sum)
+save(w, file = "meanvar_w.Rdata")
+mv_return = data.frame(date=portfolio$Date[-(1:251)],
+                       value=diag(w %*% t(P_hat[251:4938,])))
+save(mv_return, file = "mv_return.Rdata")
+#############################
+date=portfolio$Date[-(1:251)]
+df <- data.frame(date=as.Date(character()),
+                 weight=numeric(),
+                 stock=character()) 
+for (i in 1:22) {
+  d = data.frame(date=date, weight=w[,i],stocks=rep(stock[i],length(date)))
+  df = rbind(df, d) #df is used for weights plots
+}
+df4=df
+
+
+#==============================================================================#
+#                                   make plot                                  #
+#==============================================================================#
+ggplot(df1, aes(x = date, y = weight, fill = stocks)) +
+  geom_area() +
+  scale_fill_manual(values = c('#822245',
+                               '#A32551',
+                               '#CB125E',
+                               '#CD5C5C',
+                               '#F08080',
+                               '#FFA07A',
+                               '#FFB6C1',
+                               '#FFE4E1',
+                               '#FFE4B5',
+                               '#FFFACD',
+                               '#F0E68C',
+                               '#B4AB2E',
+                               '#8B8F29',
+                               '#586416',
+                               '#567D0F',
+                               '#1B5717',
+                               '#227252',
+                               '#17906F',
+                               '#20B2AA',
+                               '#50CEC3',
+                               '#88D0D8',
+                               '#B4E2E7'
+                              ))+
+  ggtitle("Portfolio weights: min ES")+
+  theme_classic()+
+  theme(panel.background = element_blank())
+
+
+ggplot(df2, aes(x = date, y = weight, fill = stocks)) +
+  geom_area() +
+  scale_fill_manual(values =  c('#822245',
+                                '#A32551',
+                                '#CB125E',
+                                '#CD5C5C',
+                                '#F08080',
+                                '#FFA07A',
+                                '#FFB6C1',
+                                '#FFE4E1',
+                                '#FFE4B5',
+                                '#FFFACD',
+                                '#F0E68C',
+                                '#B4AB2E',
+                                '#8B8F29',
+                                '#586416',
+                                '#567D0F',
+                                '#1B5717',
+                                '#227252',
+                                '#17906F',
+                                '#20B2AA',
+                                '#50CEC3',
+                                '#88D0D8',
+                                '#B4E2E7'
+  ))+
+  ggtitle("Portfolio weights: max Return")+
+  theme_classic()+
+  theme(panel.background = element_blank())
+
+
+
+ggplot(df3, aes(x = date, y = weight, fill = stocks)) +
+  geom_area() +
+  scale_fill_manual(values = c('#822245',
+                               '#A32551',
+                               '#CB125E',
+                               '#CD5C5C',
+                               '#F08080',
+                               '#FFA07A',
+                               '#FFB6C1',
+                               '#FFE4E1',
+                               '#FFE4B5',
+                               '#FFFACD',
+                               '#F0E68C',
+                               '#B4AB2E',
+                               '#8B8F29',
+                               '#586416',
+                               '#567D0F',
+                               '#1B5717',
+                               '#227252',
+                               '#17906F',
+                               '#20B2AA',
+                               '#50CEC3',
+                               '#88D0D8',
+                               '#B4E2E7'
+  ))+
+  ggtitle("Portfolio weights: naive 1/N")+
+  theme_classic()+
+  theme(panel.background = element_blank())
+
+
+ggplot(df4, aes(x = date, y = weight, fill = stocks)) +
+  geom_area() +
+  scale_fill_manual(values =  c('#822245',
+                                '#A32551',
+                                '#CB125E',
+                                '#CD5C5C',
+                                '#F08080',
+                                '#FFA07A',
+                                '#FFB6C1',
+                                '#FFE4E1',
+                                '#FFE4B5',
+                                '#FFFACD',
+                                '#F0E68C',
+                                '#B4AB2E',
+                                '#8B8F29',
+                                '#586416',
+                                '#567D0F',
+                                '#1B5717',
+                                '#227252',
+                                '#17906F',
+                                '#20B2AA',
+                                '#50CEC3',
+                                '#88D0D8',
+                                '#B4E2E7'
+  ))+
+  ggtitle("Portfolio weights: mean-variance")+
+  theme_classic()+
+  theme(panel.background = element_blank())
+
+
+################################################################################
+min=data.frame(date=min_ES$date, value=apply(P_hat[-(1:250),],1,min))
+max=data.frame(date=min_ES$date, value=apply(P_hat[-(1:250),],1,max))
+plot(min$date, min$value,type = "l",col="azure2",
+     xlab="Date",
+     ylab="realized return (log)", ylim = c(-0.8,0.5))
+lines(max$date, max$value,type = "l",col="azure2")
+lines(max_return$date,max_return$value, type="l",
+     col='#84C971', xlab="Date",
+     ylab="realized return (log)")
+lines(mv_return$date,mv_return$value,type="l",col='gold')
+lines(min_ES$date,min_ES$value, type="l",col="#DC143C")
+lines(naive_portfolio$Date[-(1:251)],
+      naive_return[-(1:250)],type="l", col='grey3')
+abline(h = log(0.9),lty=2,col='grey20')
+abline(h = log(1.1),lty=2,col='grey20')
+text(x=as.Date("2021-12-30"),
+     y=log(1.15),
+     "log(1.1)",cex=0.5)
+text(x=as.Date("2021-12-30"),
+     y=log(0.8),
+     "log(0.9)",cex=0.5)
+legend("topright",
+       legend = c("Naive 1/N","Mean-Variance","Max Return","Min ES"),
+       lty = c(1,1,1,1),
+       lwd = c(1.5,1.5,1.5,1.5),
+       col = c("grey3","gold","#84C971","#DC143C"),
+       cex = 0.5)
+
+#==============================================================================#
+#                       Summary Statistics for portfolios                      #
+#==============================================================================#
+length(naive_return[-(1:250)]); kurtosis(naive_return); skewness(naive_return)
+mv_return$date[1]; kurtosis(mv_return$value); skewness(mv_return$value)
+tail(mv_return$date,1)
+kurtosis(min_ES$value); skewness(min_ES$value)
+kurtosis(max_return$value); skewness(max_return$value)
+
+adf.test(naive_return);adf.test(mv_return$value)
+adf.test(min_ES$value);adf.test(max_return$value)
