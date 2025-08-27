@@ -1,0 +1,1404 @@
+#==============================================================================#
+#                  Forecasting VaR and ES by the LSTM-AL model                 #
+#                                                                              #
+# Quick summary:                                                               #
+# The model specification is based on ES-CAViaR framework (Taylor 2009), with  #
+# additional parameters modeled by long short-term memory model (LSTM). All    #
+# model parameters are optimized via adaptive MCMC with Bayesian inference,    # 
+# and Asymmetric Laplace (AL) density is used as the likelihood.               #
+#                                                                              #                                                                              
+# Input: use percentage log returns, not taken negated here.                   #
+#                                                                              #                                                                             
+# Reference:                                                                   #
+# Forecast model (LSTM-AL) used here is proposed in the following paper:       #
+# [Z. Li., M. N. Tran, C. Wang, R. H. Gerlach, J. Gao. A Bayesian long-short   #
+# term memory model for Value-at-risk and expected shortfall joint forecasting.#
+# Preprint, arXiv:2001.08374v2, 2021.]                                         #
+#                                                                              #
+# Note:                                                                        #              
+# for the sake of computational efficiency, I use expanding windows to make    #
+# predictions, which is different from their application.                      #
+#                                                                              #
+# Claim:                                                                       #
+# To the best of my knowledge, their code are not published, and the following # 
+# code is written based on my understanding of their paper.                    #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+setwd("C:/Users/1/OneDrive/桌面/portfolio")
+library(mvtnorm)
+library(rmutil)
+library(KSD)
+library(Matrix)
+library(matrixcalc)
+library(invgamma)
+library(fBasics)
+library(tseries)
+
+#==============================================================================#
+#                          Load and prepare datasets                           #
+#                    descriptions are given after each line                    #
+#==============================================================================#
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_portfolio.Rdata") 
+# load naive 1/N portfolio (in value); dataframe name is file name
+naive_return = -log(naive_portfolio$Value[-1]/naive_portfolio$Value[-4939])*100 
+# transform into negated percentage log returns
+
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_return.Rdata") 
+# load mean-variance portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/min_ES.Rdata") 
+# load minimum ES portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/max_return.Rdata") 
+# load maximum return portfolio (in log returns); dataframe name is file name
+
+load("C:/Users/1/OneDrive/桌面/portfolio/SSE_return100.Rdata") 
+# load SSE index returns (in percentage log returns); dataframe name: SSE.ret
+
+load("C:/Users/1/OneDrive/桌面/portfolio/RMBUSD_return100.Rdata") 
+# load RMB/USD returns (in percentage log returns); dataframe name: RMBUSD.ret
+
+load("C:/Users/1/OneDrive/桌面/portfolio/CBA_return100.Rdata") 
+# load ChinaBond new composite index returns (in percentage log returns); 
+# dataframe name: CBA.ret
+
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99_return100")
+# load AU9999 price (in percentage log returns); dataframe name: AU99.ret
+
+#==============================================================================#
+#                             Define Helper functions                          #
+#==============================================================================#
+tanh <- function(x) {
+  (exp(x)-exp(-x))/(exp(x)+exp(-x))
+}
+
+sigmoid <- function(x) {
+  1/(1+exp(-x))
+}
+
+LSTM <- function(x,h,c,parameter) {#parameter a vector of 12 and x,h,c scalars
+  #parameter=(u.f, w.f, b.f, u.i, w.i, b.i, u.d, w.d, b.d, u.o, w.o, b.o)
+  g.f = sigmoid(parameter[1]*x+parameter[2]*h+parameter[3])
+  g.i = sigmoid(parameter[4]*x+parameter[5]*h+parameter[6])
+  x.d = sigmoid(parameter[7]*x+parameter[8]*h+parameter[9])
+  g.o = sigmoid(parameter[10]*x+parameter[11]*h+parameter[12])
+  cell.state = g.f*c + g.i*x.d
+  output = g.o*tanh(cell.state)
+  return(list(h=output, c=cell.state))
+}
+
+LSTM.VaR.ES <- function(initial,parameter,data,VaR) {#initial=(x0,h0,c0)
+  #parameter=(beta0,beta1,y0,y1,alpha0,alpha1,parameter.LSTM)
+  w = length(data); 
+  x = initial[1]; h = initial[2]; c = initial[3];
+  VaR.path = NULL; ES.path = NULL
+  for (i in 1:w) {
+    lstm = LSTM(x,h,c,parameter[-(1:6)]); 
+    h = lstm$h; c = lstm$c; x=parameter[5]+parameter[6]*h #for next iteration
+    VaR = x+parameter[1]*abs(data[i])+parameter[2]*VaR
+    ES = (1+exp(parameter[3]+parameter[4]*h))*VaR
+    VaR.path = c(VaR.path, VaR); ES.path = c(ES.path, ES)
+  }
+  return(list(VaR=VaR.path,ES=ES.path,initial=c(x,h,c)))
+}
+
+
+likelihood <- function(r,v.new,e.new,v.old,e.old) {#r starts at the next observation
+  LH.new = (-0.975/e.new)*exp((r-v.new)*(0.025-as.numeric(r<=v.new))/(0.025*e.new))
+  LH.old = (-0.975/e.old)*exp((r-v.old)*(0.025-as.numeric(r<=v.old))/(0.025*e.old))
+  LH = LH.new/LH.old
+  LH[which(LH.new<0)]=0
+  return(LH)
+}
+
+Prior <- function(new,old) {
+  if (new[6] < 0) {prior=0}
+  else {
+    p.new = c(dnorm(c(new[5],new[7:18]),sd=sqrt(0.1)),dinvgauss(new[6],2.5,0.25))
+    p.old = c(dnorm(c(old[5],old[7:18]),sd=sqrt(0.1)),dinvgauss(old[6],2.5,0.25))
+    prior = p.new/p.old
+  }
+  return(prior)
+}
+
+#==============================================================================#
+#                         Adaptive Metropolis algorithm                        #
+#==============================================================================#
+#                         (Roberts and Rosenthal, 2009)                        #
+# Input: data (a vector of length w, where w is the moving window size)        #
+#        theta, = c(beta0,beta1,y0,y1,alpha0,alpha1,parameter.LSTM)            #
+#        VaR, the initial VaR                                                  #
+#        initial, the initial x,h,c for LSTM                                   #
+# Output: accepted parameters matrix (last column: from which iteration)       #
+#==============================================================================#
+MCMC <- function(data,from,to,theta) {
+  parameters = NULL; iter = NULL; initial = c(0,0,0); trace = NULL
+  trace = rbind(trace, theta)
+  for (i in 1:15000) {
+    if (i<=36) {
+      lstm.old = LSTM.VaR.ES(initial,theta,data[from:(to-1)],0)
+      theta.s = rmvnorm(1,mean=theta,sigma=diag(18)*0.01/18)
+      lstm.new = LSTM.VaR.ES(initial,theta.s,data[from:(to-1)],0)
+      LH = likelihood(data[(from+1):to],lstm.new$VaR,
+                      lstm.new$ES,lstm.old$VaR,lstm.old$ES)
+      prior = Prior(theta.s, theta)
+      accp = prod(LH)*prod(prior); if (is.nan(accp)) {accp=0}
+      u = runif(1)
+      if (u <= min(1,accp)) {
+        theta=theta.s; parameters = rbind(parameters,theta); iter = c(iter,i)
+      } 
+      else {theta=theta};
+      trace = rbind(trace,theta)
+    }
+    else {
+      if (i==37) {sig=cov(as.matrix(parameters)); mean=apply(parameters,2,mean)}
+      lstm.old = LSTM.VaR.ES(initial,theta, data[from:(to-1)],0)
+      u = runif(1)
+      if (u<=0.05) {theta.s = rmvnorm(1,mean=theta,sigma=diag(18)*0.01/18)}
+      else {theta.s = rmvnorm(1,mean=theta,sigma=sig/18*2.38^2)}
+      
+      lstm.new = LSTM.VaR.ES(initial,theta.s,data[from:(to-1)],0)
+      LH = likelihood(data[(from+1):to],lstm.new$VaR,
+                      lstm.new$ES,lstm.old$VaR,lstm.old$ES)
+      prior = Prior(theta.s, theta)
+      accp = prod(LH)*prod(prior); if (is.nan(accp)) {accp=0}
+      u = runif(1)
+      if (u <= min(1,accp)) {
+        sig = (i-1)/i*sig+mean%*%t(mean)
+        mean = i/(i+1)*mean+as.numeric(theta)/(1+i)
+        theta = as.numeric(theta.s)
+        sig = sig+(theta%*%t(theta))/i-(mean%*%t(mean))*(i-1)/i
+        parameters = rbind(parameters,theta); iter = c(iter,i)
+      } 
+      else {
+        theta=theta; 
+        sig=cov(as.matrix(parameters)); mean=apply(parameters,2,mean)
+      }
+      trace = rbind(trace,theta)
+    }
+    print(i)
+  }
+  return(list(par=cbind(parameters,iter),trace=trace))
+}
+
+MCMC.forecast <- function(data, end.vec, from.vec, to.vec) {
+  set.seed(1)
+  theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+            rnorm(1,0,sqrt(0.1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(0.1)))
+  VaR.est = NULL; ES.est = NULL; rate = NULL
+  for (j in 1:length(from.vec)) {
+    set.seed(j)
+    f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+    par.all = MCMC(data, f, t, theta) #train
+    par = apply(par.all[par.all[,19]>4500,1:18],2,mean) #keep only after burn-in
+    forecast = LSTM.VaR.ES(c(0,0,0),
+                           par,
+                           data[f:e],
+                           0)
+    if (j==length(from.vec)) {t=t/2} else {t=t}
+    VaR.est = c(VaR.est, forecast$VaR[-(1:t)])
+    ES.est = c(ES.est, forecast$ES[-(1:t)])
+    rate = c(rate, nrow(par.all))
+    #update for next run(set previous optimal theta as new initial)
+    theta = par
+    print(j)
+  }
+  return(list(VaR=VaR.est,ES=ES.est,rate=rate))
+}
+
+#==============================================================================#
+#                         Train LSTM on 4 Portfolios                           #
+#==============================================================================#
+################################################################################
+################################# naive ########################################
+naive.LSTM = MCMC.forecast(naive_return, 
+                           c(500,1000,2000,4000,4938), 
+                           c(1,1,1,1,2001), 
+                           c(250,500,1000,2000,4000))
+
+save(naive.LSTM, file = "naiveLSTM.Rdata")
+################################################################################
+################################## mv ##########################################
+set.seed(1)
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(0.1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(0.1)))
+  from.vec=c(1,1,1,1,2001);to.vec=c(250,500,1000,2000,4000);
+  end.vec=c(500,1000,2000,4000,4688)
+  j=1
+  f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+  set.seed(3)
+  par.all = MCMC(mv_return$value*100, f, t, theta)
+  par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+  forecast1 = LSTM.VaR.ES(c(0,0,0),
+                         par,
+                         mv_return$value[f:e]*100,
+                         0)
+  if (j==length(from.vec)) {t=t/2} else {t=t}
+  VaR.est1 = forecast1$VaR[-(1:t)]
+  ES.est1 = forecast1$ES[-(1:t)]
+  rate = nrow(par.all)
+  theta = par
+  
+  j=2
+  f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+  set.seed(3)
+  theta=par.all[30,1:18]
+  par.all = MCMC(mv_return$value*100, f, t, theta)
+  par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+  forecast2 = LSTM.VaR.ES(c(0,0,0),
+                          par,
+                          mv_return$value[f:e]*100,
+                          0)
+  if (j==length(from.vec)) {t=t/2} else {t=t}
+  VaR.est2 = forecast2$VaR[-(1:t)]
+  ES.est2 = forecast2$ES[-(1:t)]
+  rate = nrow(par.all)
+  theta = par
+  
+  j=3
+  theta=par.all2[3,1:18]
+  f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+  set.seed(1)
+  par.all = MCMC(mv_return$value*100, f, t, theta)
+  par.all2 = MCMC(mv_return$value*100, f, t, theta)
+  par.all3 = MCMC(mv_return$value*100, f, t, theta)
+  par.all = rbind(par.all,par.all2,par.all3)
+  par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+  forecast3 = LSTM.VaR.ES(c(0,0,0),
+                          par,
+                          mv_return$value[f:e]*100,
+                          0)
+  if (j==length(from.vec)) {t=t/2} else {t=t}
+  VaR.est3 = forecast3$VaR[-(1:t)]
+  ES.est3 = forecast3$ES[-(1:t)]
+  rate = nrow(par.all)
+  theta = par
+  
+  j=4
+  f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+  theta = par.all2[100,1:18]
+  par.all = MCMC(mv_return$value*100, f, t, theta)
+  par.all2 = MCMC(mv_return$value*100, f, t, theta)
+  par.all3 = MCMC(mv_return$value*100, f, t, theta)
+  par = apply(par.all3[par.all3[,19]>4500,1:18],2,mean)
+  forecast4 = LSTM.VaR.ES(c(0,0,0),
+                          par,
+                          mv_return$value[f:e]*100,
+                          0)
+  if (j==length(from.vec)) {t=t/2} else {t=t}
+  VaR.est4 = forecast4$VaR[-(1:t)]
+  ES.est4 = forecast4$ES[-(1:t)]
+  rate = nrow(par.all3)
+  theta = par
+  
+  j=5
+  f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+  par.all = MCMC(mv_return$value*100, f, t, theta)
+  par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+  forecast5 = LSTM.VaR.ES(c(0,0,0),
+                          par,
+                          mv_return$value[f:e]*100,
+                          0)
+  if (j==length(from.vec)) {t=t/2} else {t=t}
+  VaR.est5 = forecast5$VaR[-(1:t)]
+  ES.est5 = forecast5$ES[-(1:t)]
+  rate = nrow(par.all)
+  theta = par
+
+mv.LSTM = list(ES=c(ES.est1,ES.est2,ES.est3,ES.est4,ES.est5),
+               VaR=c(VaR.est1,VaR.est2,VaR.est3,VaR.est4,VaR.est5),
+               rate=c(2637,1863,1638,3349,1045))
+
+save(mv.LSTM, file = "mvLSTM.Rdata")
+################################################################################
+############################### min ES #########################################
+set.seed(1)
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(0.1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(0.1)))
+from.vec=c(1,1,1,1,2001);to.vec=c(250,500,1000,2000,4000);
+end.vec=c(500,1000,2000,4000,4688)
+j=1
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(min_ES$value, f, t, replace(theta,1,-0.1))
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast1 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        min_ES$value[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est1 = forecast1$VaR[-(1:t)]
+ES.est1 = forecast1$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+
+j=2
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(min_ES$value, f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast2 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        min_ES$value[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est2 = forecast2$VaR[-(1:t)]
+ES.est2 = forecast2$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+
+j=3
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(min_ES$value, f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast3 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        min_ES$value[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est3 = forecast3$VaR[-(1:t)]
+ES.est3 = forecast3$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+
+j=4
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(min_ES$value, f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast4 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        min_ES$value[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est4 = forecast4$VaR[-(1:t)]
+ES.est4 = forecast4$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+
+j=5
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(min_ES$value, f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast5 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        min_ES$value[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est5 = forecast5$VaR[-(1:t)]
+ES.est5 = forecast5$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+
+minES.LSTM = list(ES=c(ES.est1,ES.est2,ES.est3,ES.est4,ES.est5),
+               VaR=c(VaR.est1,VaR.est2,VaR.est3,VaR.est4,VaR.est5),
+               rate=c(1998,2402,1088,4490,2042))
+
+save(minES.LSTM, file = "minESLSTM.Rdata")
+################################################################################
+############################### max return #####################################
+set.seed(1)
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(1)))
+
+from.vec=c(1,1,1,1,2001);to.vec=c(250,500,1000,2000,4000);
+end.vec=c(500,1000,2000,4000,4688)
+j=1
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(max_return$value*100, f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast1 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        max_return$value[f:e]*100,
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est1 = forecast1$VaR[-(1:t)]
+ES.est1 = forecast1$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+# visually check
+plot(max_return$value[(251:1000)]*100,type="l")
+lines(ES.est1,col="blue")
+
+
+j=2
+theta = c(runif(1,-2.7,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(1)),rinvgamma(1,2.5,0.25),rnorm(12,-0.5,sqrt(1)))
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(max_return$value*100, f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast2 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        max_return$value[f:e]*100,
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est2 = forecast2$VaR[-(1:t)]
+ES.est2 = forecast2$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+# visually check
+plot(max_return$value[(251:4000)]*100,type="l")
+lines(c(ES.est1,ES.est2),col="red")
+
+
+
+j=3
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(1)))
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(max_return$value*100,f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast3 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        max_return$value[f:e]*100,
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est3 = forecast3$VaR[-(1:t)]
+ES.est3 = forecast3$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+# visually check
+plot(max_return$value[(1001:2000)]*100,type="l",ylim=c(-20,10))
+lines(ES.est3,col="red")
+
+
+j=4
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+theta = par.all[100,1:18]
+par.all = MCMC(max_return$value*100, f, t, theta)
+theta = par.all[3,1:18]
+par.all2 = MCMC(max_return$value*100, f, t, theta)
+par.all = rbind(par.all,par.all2)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast4 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        max_return$value[f:e]*100,
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est4 = forecast4$VaR[-(1:t)]
+ES.est4 = forecast4$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(max_return$value[(2001:4000)]*100,type="l",ylim=c(-20,10))
+lines(ES.est4,col="red")
+
+j=5
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(max_return$value*100, f, t, theta)
+par = apply(par.all[par.all[,19]>4500,1:18],2,mean)
+forecast5 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        max_return$value[f:e]*100,
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est5 = forecast5$VaR[-(1:t)]
+ES.est5 = forecast5$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+# visually check
+plot(max_return$value[(4001:4688)]*100,type="l",ylim=c(-20,10))
+lines(ES.est5,col="red")
+
+maxR.LSTM = list(ES=c(ES.est1,ES.est2,ES.est3,ES.est4,ES.est5),
+                 VaR=c(VaR.est1,VaR.est2,VaR.est3,VaR.est4,VaR.est5),
+                 rate=c(3459,1315,1037,1165,2494))
+save(maxR.LSTM, file = "maxRLSTM.Rdata")
+
+#==============================================================================#
+#                         Train LSTM on market indices                         #
+#==============================================================================#
+################################################################################
+####################################  SSE  #####################################
+set.seed(1)
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(0.1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(0.1)))
+from.vec=c(1,1,1,1,2001);to.vec=c(250,500,1000,2000,4000);
+end.vec=c(500,1000,2000,4000,5094)
+j=1
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(SSE.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast1 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        SSE.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est1 = forecast1$VaR[-(1:t)]
+ES.est1 = forecast1$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(SSE.ret$return[251:500],type="l")
+lines(VaR.est1,col="blue")
+lines(ES.est1,col="green")
+
+j=2
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(SSE.ret$return, f, t, theta*3)
+par.all2 = MCMC(SSE.ret$return, f, t, par.all[10,1:18])
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast2 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        SSE.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est2 = forecast2$VaR[-(1:t)]
+ES.est2 = forecast2$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(SSE.ret$return[501:1000],type="l")
+lines(ES.est2,col="red")
+
+
+j=3
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(SSE.ret$return, f, t, theta/3)
+par.all2 = MCMC(SSE.ret$return, f, t, par.all[3,1:18])
+par.all = rbind(par.all, par.all2)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast3 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        SSE.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est3 = forecast3$VaR[-(1:t)]
+ES.est3 = forecast3$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(SSE.ret$return[2001:4000],type="l")
+lines(ES.est4,col="red")
+
+
+j=4
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+theta = par.all2[100,1:18]
+par.all = MCMC(SSE.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast4 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        SSE.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est4 = forecast4$VaR[-(1:t)]
+ES.est4 = forecast4$ES[-(1:t)]
+rate = nrow(par.all)
+theta = par
+
+j=5
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(SSE.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast5 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        SSE.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est5 = forecast5$VaR[-(1:t)]
+ES.est5 = forecast5$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+
+SSE.LSTM = list(ES=c(ES.est1,ES.est2,ES.est3,ES.est4,ES.est5),
+               VaR=c(VaR.est1,VaR.est2,VaR.est3,VaR.est4,VaR.est5),
+               rate=c(2246,1031,1729,2567,3909))
+save(SSE.LSTM, file = "SSELSTM.Rdata")
+
+plot(SSE.ret$return[-(1:250)],type="l")
+lines(SSE.LSTM$ES,col="blue")
+
+################################################################################
+####################################  CBA  #####################################
+set.seed(1)
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(0.1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(0.1)))
+from.vec=c(1,1,1,1,2001);to.vec=c(250,500,1000,2000,4000);
+end.vec=c(500,1000,2000,4000,5254)
+j=1
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(CBA.ret$return, f, t, theta)
+par.all2 = MCMC(CBA.ret$return, f, t, par.all$par[3,1:18])
+par.all3 = MCMC(CBA.ret$return, f, t, par.all2$par[1000,1:18])
+par.all4 = MCMC(CBA.ret$return, f, t, par.all3$par[3000,1:18])
+par.all5 = MCMC(CBA.ret$return, f, t, par.all4$par[29,1:18])
+par.all6 = MCMC(CBA.ret$return, f, t, par.all5$par[200,1:18])
+
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.3 = apply(par.all3$par[par.all3$par[,19]>4500,1:18],2,mean)
+par.4 = apply(par.all4$par[par.all4$par[,19]>4500,1:18],2,mean)
+par.5 = apply(par.all5$par[par.all5$par[,19]>4500,1:18],2,mean)
+par.6 = apply(par.all6$par[par.all6$par[,19]>4500,1:18],2,mean)
+forecast1 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        CBA.ret$return[f:e],
+                        0)
+forecast1.2 = LSTM.VaR.ES(c(0,0,0),
+                        par.2,
+                        CBA.ret$return[f:e],
+                        0)
+forecast1.3 = LSTM.VaR.ES(c(0,0,0),
+                          par.3,
+                          CBA.ret$return[f:e],
+                          0)
+forecast1.4 = LSTM.VaR.ES(c(0,0,0),
+                          par.4,
+                          CBA.ret$return[f:e],
+                          0)
+forecast1.5 = LSTM.VaR.ES(c(0,0,0),
+                          par.5,
+                          CBA.ret$return[f:e],
+                          0)
+forecast1.6 = LSTM.VaR.ES(c(0,0,0),
+                          par.6,
+                          CBA.ret$return[f:e],
+                          0)
+
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est1 = forecast1$VaR[-(1:t)]
+ES.est1 = forecast1$ES[-(1:t)]
+ES.est1.2 = forecast1.2$ES[-(1:t)]
+ES.est1.3 = forecast1.3$ES[-(1:t)]
+ES.est1.4 = forecast1.4$ES[-(1:t)]
+ES.est1.5 = forecast1.5$ES[-(1:t)]
+ES.est1.6 = forecast1.6$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(-CBA.ret$return[251:500],type="l",xlab="Date index",ylim=c(-0.6,0.7),
+     ylab="negated log return %",lwd=1)
+plot(-ES.est1, col="#CB125E", lwd=1.5,type="l",
+     ylab="negated log return %",xlab="Date index")
+lines(-ES.est1.2, col='darkorange3',lwd=1.5)
+lines(-ES.est1.3,col="#B4AB2f",lwd=1.5)
+lines(-ES.est1.4,col="darkseagreen2",lwd=1.5)
+lines(-ES.est1.5,col="palegreen4",lwd=1.5)
+lines(-ES.est1.6,col="darkolivegreen",lwd=1.5)
+legend("topleft",
+       c("chain 1","chain 2","chain 3",
+         "chain 4", "chain 5", "chain 6"),
+       col=c("#CB125E",'darkorange3',"#B4AB2f",
+             "darkseagreen2","palegreen4","darkolivegreen"
+       ), lty=c(1,1,1,1,1,1),lwd=2,cex=0.5)
+
+
+j=2
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(CBA.ret$return, f, t, theta)
+par.all2 = MCMC(CBA.ret$return, f, t, par.all$par[10,1:18])
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+forecast2 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        CBA.ret$return[f:e],
+                        0)
+forecast2.2 = LSTM.VaR.ES(c(0,0,0),
+                        par.2,
+                        CBA.ret$return[f:e],
+                        0)
+
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est2 = forecast2.2$VaR[-(1:t)]
+ES.est2 = forecast2.2$ES[-(1:t)]
+ES.est2.2 = forecast2.2$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(CBA.ret$return[501:1000],type="l")
+lines(ES.est2,col="red")
+lines(ES.est2.2,col="green",type="l")
+# check stationary
+plot(par.all2$trace[,1],ylab="paramter 1",xlab="iteration")
+plot(par.all2$trace[,2],ylab="paramter 2",xlab="iteration")
+plot(par.all2$trace[,3],ylab="paramter 3",xlab="iteration")
+plot(par.all2$trace[,4],ylab="paramter 4",xlab="iteration")
+plot(par.all2$trace[,5],ylab="paramter 5",xlab="iteration")
+plot(par.all2$trace[,6],ylab="paramter 6",xlab="iteration")
+plot(par.all2$trace[,7],ylab="paramter 7",xlab="iteration")
+plot(par.all2$trace[,8],ylab="paramter 8",xlab="iteration")
+plot(par.all2$trace[,9],ylab="paramter 9",xlab="iteration")
+plot(par.all2$trace[,10],ylab="paramter 10",xlab="iteration")
+plot(par.all2$trace[,11],ylab="paramter 11",xlab="iteration")
+plot(par.all2$trace[,12],ylab="paramter 12",xlab="iteration")
+plot(par.all2$trace[,13],ylab="paramter 13",xlab="iteration")
+plot(par.all2$trace[,14],ylab="paramter 14",xlab="iteration")
+plot(par.all2$trace[,15],ylab="paramter 15",xlab="iteration")
+plot(par.all2$trace[,16],ylab="paramter 16",xlab="iteration")
+plot(par.all2$trace[,17],ylab="paramter 17",xlab="iteration")
+plot(par.all2$trace[,18],ylab="paramter 18",xlab="iteration")
+
+j=3
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(CBA.ret$return, f, t, theta)
+par.all2 = MCMC(CBA.ret$return, f, t, par.all[3,1:18])
+par.all = rbind(par.all, par.all2)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast3 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        CBA.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est3 = forecast3$VaR[-(1:t)]
+ES.est3 = forecast3$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(CBA.ret$return[1001:2000],type="l")
+lines(ES.est3,col="red")
+
+
+j=4
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+theta = par.all2[100,1:18]
+par.all = MCMC(CBA.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast4 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        CBA.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est4 = forecast4$VaR[-(1:t)]
+ES.est4 = forecast4$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(CBA.ret$return[2001:4000],type="l")
+lines(ES.est4,col="red")
+
+
+j=5
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(CBA.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast5 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        CBA.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est5 = forecast5$VaR[-(1:t)]
+ES.est5 = forecast5$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(CBA.ret$return[4001:5254],type="l")
+lines(ES.est5,col="red")
+
+
+CBA.LSTM = list(ES=c(ES.est1,ES.est2,ES.est3,ES.est4,ES.est5),
+                VaR=c(VaR.est1,VaR.est2,VaR.est3,VaR.est4,VaR.est5),
+                rate=c(2653,1393,1289,4743,1962))
+save(CBA.LSTM, file = "CBALSTM.Rdata")
+
+plot(CBA.ret$return[-(1:250)],type="l")
+lines(CBA.LSTM$ES,col="blue")
+
+
+################################################################################
+####################################  AU99  ####################################
+set.seed(1)
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(0.1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(0.1)))
+from.vec=c(1,1,1,1,2001);to.vec=c(250,500,1000,2000,4000);
+end.vec=c(500,1000,2000,4000,4625)
+j=1
+theta = par.all$par[30,1:18]
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(AU99.ret$return, f, t, theta)
+par.all2 = MCMC(AU99.ret$return, f, t, theta)
+par.all3 = MCMC(AU99.ret$return, f, t, par.all2$par[100,1:18]*1.1)
+par.all4 = MCMC(AU99.ret$return, f, t, par.all3$par[500,1:18]*(0.5))
+par.all5 = MCMC(AU99.ret$return, f, t, par.all4$par[30,1:18])
+par.all6 = MCMC(AU99.ret$return, f, t, par.all5$par[3000,1:18]*2)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.3 = apply(par.all3$par[par.all3$par[,19]>4500,1:18],2,mean)
+par.4 = apply(par.all4$par[par.all4$par[,19]>4500,1:18],2,mean)
+par.5 = apply(par.all5$par[par.all5$par[,19]>4500,1:18],2,mean)
+par.6 = apply(par.all6$par[par.all6$par[,19]>4500,1:18],2,mean)
+par.opt = (par+par.2+par.3+par.4+par.5)/5
+forecast1 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        AU99.ret$return[f:e],
+                        0)
+forecast1.2 = LSTM.VaR.ES(c(0,0,0),
+                        par.2,
+                        AU99.ret$return[f:e],
+                        0)
+forecast1.3 = LSTM.VaR.ES(c(0,0,0),
+                          par.3,
+                          AU99.ret$return[f:e],
+                          0)
+forecast1.4 = LSTM.VaR.ES(c(0,0,0),
+                          par.4,
+                          AU99.ret$return[f:e],
+                          0)
+forecast1.5 = LSTM.VaR.ES(c(0,0,0),
+                          par.5,
+                          AU99.ret$return[f:e],
+                          0)
+forecast1.6 = LSTM.VaR.ES(c(0,0,0),
+                          par.6,
+                          AU99.ret$return[f:e],
+                          0)
+forecast1.opt = LSTM.VaR.ES(c(0,0,0),
+                          par.opt,
+                          AU99.ret$return[f:e],
+                          0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est1 = forecast1$VaR[-(1:t)]
+ES.est1 = forecast1$ES[-(1:t)]
+ES.est1.2 = forecast1.2$ES[-(1:t)]
+ES.est1.3 = forecast1.3$ES[-(1:t)]
+ES.est1.4 = forecast1.4$ES[-(1:t)]
+ES.est1.5 = forecast1.5$ES[-(1:t)]
+ES.est1.6 = forecast1.6$ES[-(1:t)]
+ES.est1.opt = forecast1.opt$ES[-(1:t)];VaR.est1.opt = forecast1.opt$VaR[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(-AU99.ret$return[251:500],type="l",ylim=c(-3,6.5),
+     xlab="Date index",ylab="negated log return %")
+lines(-ES.est1,col="darkorange3",lwd=1.5,type="l")
+lines(-ES.est1.2,col="#CB125E",lwd=1.5)
+lines(-ES.est1.3,col="#B4AB2f",lwd=1.5)
+lines(-ES.est1.4,col="#227252",lwd=1.5)
+lines(-ES.est1.5,col="darkseagreen3",lwd=1.5)
+lines(-ES.est1.6,col="#F0E68C",lwd=1.5)
+legend("bottomleft",
+       c("chain 1","chain 2","chain 3",
+         "chain 4", "chain 5", "chain 6"),
+       col=c('darkorange3',"#CB125E","#B4AB2f","#227252",
+             "darkseagreen3","#F0E68C"), 
+       lty=c(1,1,1,1,1,1),lwd=2,cex=0.45)
+
+
+j=2
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(AU99.ret$return, f, t, theta)
+par.all2 = MCMC(AU99.ret$return, f, t, par.all$par[10,1:18])
+par.all3 = MCMC(AU99.ret$return, f, t, par.all2$par[100,1:18])
+par.all4 = MCMC(AU99.ret$return, f, t, par.all3$par[300,1:18]*0.5)
+par.all5 = MCMC(AU99.ret$return, f, t, par.all4$par[3,1:18])
+par.all6 = MCMC(AU99.ret$return, f, t, theta)
+
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.3 = apply(par.all3$par[par.all3$par[,19]>4500,1:18],2,mean)
+par.4 = apply(par.all4$par[par.all4$par[,19]>4500,1:18],2,mean)
+par.5 = apply(par.all5$par[par.all5$par[,19]>4500,1:18],2,mean)
+par.6 = apply(par.all6$par[par.all6$par[,19]>4500,1:18],2,mean)
+par.opt = (par.2+par.3+par.4+par.5+par.6)/5
+forecast2 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        AU99.ret$return[f:e],
+                        0)
+forecast2.2 = LSTM.VaR.ES(c(0,0,0),
+                        par.2,
+                        AU99.ret$return[f:e],
+                        0)
+forecast2.3 = LSTM.VaR.ES(c(0,0,0),
+                          par.3,
+                          AU99.ret$return[f:e],
+                          0)
+forecast2.4 = LSTM.VaR.ES(c(0,0,0),
+                          par.4,
+                          AU99.ret$return[f:e],
+                          0)
+forecast2.5 = LSTM.VaR.ES(c(0,0,0),
+                          par.5,
+                          AU99.ret$return[f:e],
+                          0)
+forecast2.6 = LSTM.VaR.ES(c(0,0,0),
+                          par.6,
+                          AU99.ret$return[f:e],
+                          0)
+forecast2.opt = LSTM.VaR.ES(c(0,0,0),
+                          par.opt,
+                          AU99.ret$return[f:e],
+                          0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est2.opt = forecast2.opt$VaR[-(1:t)]
+ES.est2.opt = forecast2.opt$ES[-(1:t)]
+ES.est2 = forecast2$ES[-(1:t)]
+ES.est2.2 = forecast2.2$ES[-(1:t)]
+ES.est2.3 = forecast2.3$ES[-(1:t)]
+ES.est2.4 = forecast2.4$ES[-(1:t)]
+ES.est2.5 = forecast2.5$ES[-(1:t)]
+ES.est2.6 = forecast2.6$ES[-(1:t)]
+ES.est2.opt = forecast2.opt$ES[-(1:t)]
+rate = nrow(par.all6$par)
+theta = par
+# visually check
+plot(-AU99.ret$return[501:1000],type="l",ylim=c(-5,9),
+     xlab="Date index",ylab="negated log return %")
+lines(-ES.est2,col="#CB125E",lwd=1.5)
+lines(-ES.est2.2,col="darkorange3",lwd=1.5)
+lines(-ES.est2.3,col="darkseagreen3",lwd=1.5)
+lines(-ES.est2.4,col="#B4AB2f",lwd=1.5)
+lines(-ES.est2.5,col="#F0E68C",lwd=1.5)
+lines(-ES.est2.6,col="darkolivegreen",lwd=1.5)
+legend("bottomright",
+       c("chain 1","chain 2","chain 3",
+         "chain 4", "chain 5", "chain 6"),
+       col=c('#CB125E',"darkorange3","darkseagreen3","#B4AB2f",
+             "#F0E68C","darkolivegreen"), 
+       lty=c(1,1,1,1,1,1),lwd=2,cex=0.45)
+
+
+
+j=3
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(AU99.ret$return, f, t, theta)
+par.all2 = MCMC(AU99.ret$return, f, t, par.all$par[3,1:18])
+par.all3 = MCMC(AU99.ret$return, f, t, par.all2$par[10,1:18])
+par.all4 = MCMC(AU99.ret$return, f, t, par.all3$par[100,1:18]*0.5)
+
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.3 = apply(par.all3$par[par.all3$par[,19]>4500,1:18],2,mean)
+par.4 = apply(par.all4$par[par.all4$par[,19]>4500,1:18],2,mean)
+par.opt = (par+par.2+par.3+par.4)/4
+forecast3 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        AU99.ret$return[f:e],
+                        0)
+forecast3.2 = LSTM.VaR.ES(c(0,0,0),
+                        par.2,
+                        AU99.ret$return[f:e],
+                        0)
+forecast3.3 = LSTM.VaR.ES(c(0,0,0),
+                        par.3,
+                        AU99.ret$return[f:e],
+                        0)
+forecast3.4 = LSTM.VaR.ES(c(0,0,0),
+                          par.4,
+                          AU99.ret$return[f:e],
+                          0)
+forecast3.opt = LSTM.VaR.ES(c(0,0,0),
+                          par.opt,
+                          AU99.ret$return[f:e],
+                          0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est3.opt = forecast3.opt$VaR[-(1:t)];ES.est3.opt = forecast3.opt$ES[-(1:t)]
+ES.est3 = forecast3$ES[-(1:t)]
+ES.est3.2 = forecast3.2$ES[-(1:t)]
+ES.est3.3 = forecast3.3$ES[-(1:t)]
+ES.est3.4 = forecast3.4$ES[-(1:t)]
+rate = nrow(par.all4$par)
+theta = par
+# visually check
+plot(AU99.ret$return[1001:2000],type="l")
+lines(ES.est3,col="red")
+lines(ES.est3.2,col="green")
+lines(ES.est3.3,col="blue")
+lines(ES.est3.4,col="orange")
+
+
+j=4
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+theta = par.all2[100,1:18]
+par.all = MCMC(AU99.ret$return, f, t, theta)
+par.all2 = MCMC(AU99.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.opt = (par+par.2)/2
+forecast4 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        AU99.ret$return[f:e],
+                        0)
+forecast4.2 = LSTM.VaR.ES(c(0,0,0),
+                        par.2,
+                        AU99.ret$return[f:e],
+                        0)
+forecast4.opt = LSTM.VaR.ES(c(0,0,0),
+                          par.opt,
+                          AU99.ret$return[f:e],
+                          0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est4.opt = forecast4.opt$VaR[-(1:t)]
+ES.est4 = forecast4$ES[-(1:t)]
+ES.est4.2 = forecast4.2$ES[-(1:t)]
+ES.est4.opt = forecast4.opt$ES[-(1:t)]
+rate = nrow(par.all2$par)
+theta = par
+plot(AU99.ret$return[2001:4000],type="l")
+lines(ES.est4,col="red")
+lines(ES.est4.2,col="green")
+
+
+j=5
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(AU99.ret$return, f, t, par.all$par[1,1:18])
+par.all2 = MCMC(AU99.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+forecast5 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        AU99.ret$return[f:e],
+                        0)
+forecast5.2 = LSTM.VaR.ES(c(0,0,0),
+                        par.2,
+                        AU99.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est5 = forecast5$VaR[-(1:t)]
+ES.est5 = forecast5$ES[-(1:t)]
+ES.est5.2 = forecast5.2$ES[-(1:t)]
+rate = nrow(par.all2$par)
+theta = par
+plot(AU99.ret$return[4001:4625],type="l")
+lines(ES.est5,col="red")
+lines(VaR.est5,col="green")
+
+AU99.LSTM = list(ES=c(ES.est1.opt,ES.est2.opt,ES.est3.opt,ES.est4.opt,ES.est5),
+                VaR=c(VaR.est1.opt,VaR.est2.opt,VaR.est3.opt,VaR.est4.opt,VaR.est5),
+                rate=c(7291,2793,542,5278,5089))
+save(AU99.LSTM, file = "AU99LSTM.Rdata")
+
+plot(AU99.ret$return[-(1:250)],type="l")
+lines(AU99.LSTM$ES,col="blue")
+
+
+################################################################################
+#################################  RMB/USD  ####################################
+set.seed(1)
+theta = c(runif(1,-2.5,0),runif(1,-0.1,0.5),runif(2,-0.1,0),
+          rnorm(1,0,sqrt(0.1)),rinvgamma(1,2.5,0.25),rnorm(12,0,sqrt(0.1)))
+from.vec=c(1,1,1,1,2001);to.vec=c(250,500,1000,2000,4000);
+end.vec=c(500,1000,2000,4000,5282)
+j=1
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(RMBUSD.ret$return, f, t, theta)
+par.all2 = MCMC(RMBUSD.ret$return, f, t, par.all$par[25,1:18])
+
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+
+forecast1 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        RMBUSD.ret$return[f:e],
+                        0)
+
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est1 = forecast1$VaR[-(1:t)]
+ES.est1 = forecast1$ES[-(1:t)]
+if (length(which(VaR.est1 >= 0))>0) {
+  VaR.est1[which(VaR.est1 >= 0)] = 0
+  ES.est1[which(VaR.est1 >= 0)]=VaR.est1[which(VaR.est1 >= 0)]
+ }
+rate = nrow(par.all2$par)
+theta = par
+# visually check
+plot(RMBUSD.ret$return[251:500],type="l")
+lines(ES.est1,col="blue")
+lines(VaR.est1,col="green")
+
+
+j=2
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(RMBUSD.ret$return, f, t, par.all$par[1,1:18])
+par.all2 = MCMC(RMBUSD.ret$return, f, t, par.all$par[10,1:18])
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.opt = (par+par.2)/2
+
+forecast2 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        RMBUSD.ret$return[f:e],
+                        0)
+forecast2.2 = LSTM.VaR.ES(c(0,0,0),
+                          par.2,
+                          RMBUSD.ret$return[f:e],
+                          0)
+forecast2.opt = LSTM.VaR.ES(c(0,0,0),
+                          par.opt,
+                          RMBUSD.ret$return[f:e],
+                          0)
+
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est2.opt = forecast2.opt$VaR[-(1:t)]
+ES.est2.opt = forecast2.opt$ES[-(1:t)]
+ES.est2 = forecast2$ES[-(1:t)]
+ES.est2.2 = forecast2.2$ES[-(1:t)]
+rate = nrow(par.all2$par)
+theta = par
+VaR.est2.opt[which(VaR.est2.opt<ES.est2.opt)]=0
+ES.est2.opt[which(VaR.est2.opt<ES.est2.opt)]=0
+# visually check
+plot(RMBUSD.ret$return[501:1000],type="l",ylim=c(-0.5,1))
+lines(ES.est2,col="blue")
+lines(ES.est2.2,col="green")
+lines(ES.est2.opt,col="red")
+
+
+
+j=3
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(RMBUSD.ret$return, f, t, par.all2$par[1,1:18])
+par.all2 = MCMC(RMBUSD.ret$return, f, t, par.all$par[3,1:18])
+
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.opt = (par+par.2)/2
+forecast3 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        RMBUSD.ret$return[f:e],
+                        0)
+forecast3.2 = LSTM.VaR.ES(c(0,0,0),
+                          par.2,
+                          RMBUSD.ret$return[f:e],
+                          0)
+forecast3.opt = LSTM.VaR.ES(c(0,0,0),
+                            par.opt,
+                            RMBUSD.ret$return[f:e],
+                            0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est3.opt = forecast3.opt$VaR[-(1:t)]
+ES.est3.opt = forecast3.opt$ES[-(1:t)]
+ES.est3 = forecast3$ES[-(1:t)]
+ES.est3.2 = forecast3.2$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(RMBUSD.ret$return[1001:2000],type="l")
+lines(ES.est3.opt,col="red")
+lines(VaR.est3.opt,col="green")
+
+
+j=4
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+theta = par.all$par[20,1:18]
+par.all = MCMC(RMBUSD.ret$return, f, t, theta)
+par.all2 = MCMC(RMBUSD.ret$return, f, t, theta)
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+par.2 = apply(par.all2$par[par.all2$par[,19]>4500,1:18],2,mean)
+par.opt = (par+par.2)/2
+forecast4 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        RMBUSD.ret$return[f:e],
+                        0)
+forecast4.2 = LSTM.VaR.ES(c(0,0,0),
+                          par.2,
+                          RMBUSD.ret$return[f:e],
+                          0)
+forecast4.opt = LSTM.VaR.ES(c(0,0,0),
+                            par.opt,
+                            RMBUSD.ret$return[f:e],
+                            0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est4.opt = forecast4.opt$VaR[-(1:t)]
+ES.est4 = forecast4$ES[-(1:t)]
+ES.est4.2 = forecast4.2$ES[-(1:t)]
+ES.est4.opt = forecast4.opt$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+plot(RMBUSD.ret$return[2001:4000],type="l")
+lines(ES.est4,col="red")
+lines(ES.est4.2,col="green")
+lines(ES.est4.opt,col="blue")
+
+
+j=5
+f=from.vec[j]; e=end.vec[j]; t=to.vec[j]
+par.all = MCMC(RMBUSD.ret$return, f, t, par.all$par[1,1:18])
+par = apply(par.all$par[par.all$par[,19]>4500,1:18],2,mean)
+forecast5 = LSTM.VaR.ES(c(0,0,0),
+                        par,
+                        RMBUSD.ret$return[f:e],
+                        0)
+if (j==length(from.vec)) {t=t/2} else {t=t}
+VaR.est5 = forecast5$VaR[-(1:t)]
+ES.est5 = forecast5$ES[-(1:t)]
+rate = nrow(par.all$par)
+theta = par
+# visually check
+plot(RMBUSD.ret$return[4001:5282],type="l")
+lines(ES.est5,col="red")
+lines(VaR.est5,col="green")
+
+RMBUSD.LSTM = list(ES=c(ES.est1,ES.est2.opt,ES.est3.opt,ES.est4.opt,ES.est5),
+                 VaR=c(VaR.est1,VaR.est2.opt,VaR.est3.opt,VaR.est4.opt,VaR.est5),
+                 rate=c(778,137,844,1712,3090))
+save(RMBUSD.LSTM, file = "RMBLSTM.Rdata")
+
+plot(RMBUSD.ret$return[-(1:250)],type="l")
+lines(RMBUSD.LSTM$ES,col="blue")
+
+
+plot(y=-SSE.ret$return[-(1:250)],x=SSE.ret$date[-(1:250)],
+     type="l",ylab="negated log returns %",
+     xlab="Time",ylim=c(-10,10),lwd=1.5,
+     main="SSE")
+lines(y=-SSE.LSTM$VaR,x=SSE.ret$date[-(1:250)],col="#227252",lwd=1.5)
+lines(y=-SSE.LSTM$ES,x=SSE.ret$date[-(1:250)],col="#B4AB2f",lwd=1.5)
+legend("bottomright",legend=c("realized","97.5% ES","97.5% VaR"),
+       col=c("black","#B4AB2f","#227252"),
+       lty = rep(1,3),
+       lwd = rep(1.5,3),cex=0.5)
+
+
+
+#==============================================================================#
+#                            E-backtesting ES forecasts                        #
+#==============================================================================#
+source("Ebacktest_general.R")
+
+empirical_risk_est <- function(data,window) {#use negated percentage log return
+  emp_ES = NULL
+  emp_VaR = NULL
+  for (i in 1:(length(data)-window)) {
+    df = data[i:(i+window-1)]
+    var = quantile(df,0.975)
+    emp_VaR = c(emp_VaR, var)
+    emp_ES = c(emp_ES, mean(df[df >= var]))
+  }
+  return(list(emp_ES=emp_ES,emp_VaR=emp_VaR))
+}
+emp_naive = empirical_risk_est(-naive_return[-(1:250)],250)
+emp_mv = empirical_risk_est(-mv_return$value*100,250)
+emp_minES = empirical_risk_est(-min_ES$value*100,250)
+emp_maxR = empirical_risk_est(-max_return$value*100,250)
+
+yearly_test <- function(realized,ES,VaR,start,date) {
+  s = seq(from=start,to=length(realized),by=250) #yearly monitoring
+  breach1 = NULL
+  breach2 = NULL
+  breach3 = NULL
+  breach4 = NULL
+  for (i in s) {
+    test = M_l(realized, ES, VaR, 0.975, i, 250)
+    breach1 = c(breach1, date[i])
+    d1 = which(test$M_GREE > 10)[1] - i
+    breach2 = c(breach2, d1)
+    d2 = which(test$M_GREL > 10)[1] - i
+    breach3 = c(breach3, d2)
+    d3 = which(test$M_GREM > 10)[1] - i
+    breach4 = c(breach4, d3)
+    print(i)
+  }
+  return(data.frame(test_date=as.Date(breach1),GREE=breach2,GREL=breach3,GREM=breach4))
+}
+
+
+
+naive.t = M_l(-naive_return[-(1:500)], 
+              -naive.LSTM$ES[-(1:250)],
+              -naive.LSTM$VaR[-(1:250)],
+              0.975, 251, 250)
+
+mv.t = M_l(-mv_return$value[-(1:250)]*100, 
+              -mv.LSTM$ES,
+              -mv.LSTM$VaR,
+              0.975, 251, 250)
+
+minES.t = M_l(-min_ES$value[-(1:250)]*100, 
+              -minES.LSTM$ES,
+              -minES.LSTM$VaR,
+              0.975, 251, 250)
+
+maxR.t = M_l(-max_return$value[-(1:250)]*100, 
+             -maxR.LSTM$ES*100,
+              -maxR.LSTM$VaR*100,
+              0.975, 251, 250)
+################################################################################
+naive.emp.t = M_l(-naive_return[-(1:500)], 
+                 emp_naive$emp_ES,
+                 emp_naive$emp_VaR,
+                 0.975, 251, 250)
+
+mv.emp.t = M_l(-mv_return$value[-(1:250)]*100, 
+                  emp_mv$emp_ES,
+                  emp_mv$emp_VaR,
+                  0.975, 251, 250)
+
+minES.emp.t = M_l(-min_ES$value[-(1:250)]*100, 
+               emp_minES$emp_ES,
+               emp_minES$emp_VaR,
+               0.975, 251, 250)
+
+maxR.emp.t = M_l(-max_return$value[-(1:250)]*100, 
+                  emp_maxR$emp_ES,
+                  emp_maxR$emp_VaR,
+                  0.975, 251, 250)
+
+
+################################################################################
+plot(y=naive.t$M_GREM,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREM")
+lines(y=mv.t$M_GREM,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.t$M_GREM,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.t$M_GREM,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+plot(y=naive.t$M_GREE,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREE")
+lines(y=mv.t$M_GREE,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.t$M_GREE,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.t$M_GREE,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+
+plot(y=naive.t$M_GREL,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREL")
+lines(y=mv.t$M_GREL,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.t$M_GREL,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.t$M_GREL,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+plot(y=,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREM")
+lines(y=mv.t$M_GREM,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.t$M_GREM,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.t$M_GREM,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+################################################################################
+plot(y=naive.emp.t$M_GREM,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREM")
+lines(y=mv.emp.t$M_GREM,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.emp.t$M_GREM,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.emp.t$M_GREM,x=min_ES$date[-(1:250)],col="red")
+legend("bottomright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+
+plot(y=naive.emp.t$M_GREE,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREE")
+lines(y=mv.emp.t$M_GREE,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.emp.t$M_GREE,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.emp.t$M_GREE,x=min_ES$date[-(1:250)],col="red")
+legend("topright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
+
+plot(y=naive.emp.t$M_GREL,x=min_ES$date[-(1:250)],ylim=c(0, 10),
+     xlab="Time",type="l",ylab="realized e-process",
+     main="GREL")
+lines(y=mv.emp.t$M_GREL,x=min_ES$date[-(1:250)], col="green")
+lines(y=minES.emp.t$M_GREL,x=min_ES$date[-(1:250)],col="blue")
+lines(y=maxR.emp.t$M_GREL,x=min_ES$date[-(1:250)],col="red")
+legend("bottomright",legend = c('naive','mv','min ES','max return'),
+       lty=c(1,1,1,1), lwd = 2,
+       col = c("black","green","blue","red"),
+       cex = 0.5)
