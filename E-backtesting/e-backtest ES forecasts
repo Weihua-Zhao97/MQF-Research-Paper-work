@@ -1,0 +1,959 @@
+#==============================================================================#
+#                          E-backtesting all ES forecasts                      #
+#                                                                              #      
+# Quick Summary:                                                               #
+# This is the general version for e-backtes. All plots and tables are created  #
+#                                                                              #
+# Function input: start >= window + 1 (e.g., 251 or 501);                      #
+#                 L, r, z are vectors of same length;                          #
+#                 L is the negated percentage log return;                      #
+#                                                                              #
+# Reference:                                                                   #
+# The E-backtest methodology was proposed in the following paper:              #
+# [Q. Wang, R. Wang, and J. F. Ziegel. E-backtesting. Preprint, arXiv:         # 
+# 2209.00991v3, 2023. ]                                                        #
+#                                                                              #
+# Claim:                                                                       #
+# Their code is published on Github. The following code is written based on my # 
+# understanding of their paper, instead of copy & paste. Also, My code can     # 
+# produced exactly the same results as Sec 8.1 of their paper on the same data.# 
+# Note that my choice of rolling window is different from their application.   #
+#                                                                              #
+#==============================================================================#
+#                                  Setup                                       #
+#==============================================================================#
+library(tinytex)
+library(zoo)
+library(xts)
+library(rugarch)
+library(qrmtools)
+library(gt)
+library(magrittr)
+
+#==============================================================================#
+#                             Define Helper functions                          #
+#==============================================================================#
+############# Calculate (x-z)+, the non-neg difference between x,z #############
+
+nn_dif <- function(x,z) #x,z numeric value
+{ 
+  d = x-z
+  if (d < 0) {d = 0} else {d = d}
+  return(d)
+} 
+################################################################################
+########### Define model-free e-statistic for (ESp,VaRp) testing ESp ###########
+
+ep_ES <- function(x,r,z,p) #all numeric value
+{ 
+  u = nn_dif(x,z)
+  l = (1-p)*(r-z) #z<=r
+  if (u == 0 & l == 0) {e = 1}
+  else {e = u/l}
+  return(e) 
+}
+
+################################################################################
+################################## e-process ###################################
+
+### e(Lt,rt,zt):
+e_proc <- function(L,r,z,lvec,start)
+{ # L is the vector of realized loss (of same length as r and z)
+  # r is ES forecasts, z is VaR forecasts
+  # start is the starting index of back-test (1,2,3,...T)
+  e_process = rep(NA, length(L))
+  for (i in 1:length(L)) {
+    e_process[i] = ep_ES(L[i],r[i],z[i],lvec)
+  }
+  return(e_process)
+}
+
+### e(Lt,r,z):
+e_proc_GREL <- function(L,r,z,lvec,i,window)
+{ 
+  e_process = rep(NA, length(L))
+  for (j in (i-window):(i-1)) {
+    e_process[j] = ep_ES(L[j],r[i],z[i],lvec) 
+  }
+  return(e_process)
+}
+
+################################################################################
+########################## Betting process under GREE ##########################
+l_GREE <- function(L,r,z,lvec,start,window) 
+{ 
+  GREE = rep(NA, length(L))
+  m = e_proc(L,r,z,lvec,start)
+  for (i in start:length(L)) 
+  {
+    l = (m-1)^2
+    u = sum(m[(i-window):(i-1)])-window
+    l = l[(i-window):(i-1)]
+    l = sum(l)
+    if ((l == 0 & u == 0) | (l == Inf & u == Inf)) {lambda = 1}
+    else if (l != Inf & u == Inf) {lambda = 0} 
+    else if (l !=0  & u == 0) {lambda = Inf} 
+    else {lambda = u/l}
+    if (lambda < 0) {GREE[i] = 0} 
+    else if (lambda > 0.5) {GREE[i] = 0.5} 
+    else {GREE[i] = lambda}
+  }
+  return(GREE)
+}
+
+########################### Betting process under GREL #########################
+l_GREL <- function(L,r,z,lvec,start,window) 
+{
+  GREL <- rep(NA,length(L))
+  for (i in start:length(L))
+  {
+    e = e_proc_GREL(L,r,z,lvec,i,window)
+    l = (e-1)^2
+    e = e[(i-window):(i-1)]
+    l = l[(i-window):(i-1)]
+    u = sum(e)-window
+    l = sum(l)
+    if ((l == 0 & u == 0) | (l == Inf & u == Inf)) {lambda = 1}
+    else if (l != Inf & u == Inf) {lambda = 0} 
+    else if (l !=0  & u == 0) {lambda = Inf} 
+    else {lambda = u/l}
+    if (lambda < 0) {GREL[i] = 0} 
+    else if (lambda > 0.5) {GREL[i] = 0.5} 
+    else {GREL[i] = lambda}
+  }
+  return(GREL)
+}
+
+################################################################################
+############################### E-backtesting ##################################
+### Define function to the e-process {M(l)}t (via GREE, GREL, GREM)
+
+M_l <- function(L,r,z,lvec,start,window)
+{ # before start, all NA
+  L = as.numeric(L)
+  e = e_proc(L,r,z,lvec,start)
+  lambda_GREE = l_GREE(L,r,z,lvec,start,window)
+  lambda_GREL = l_GREL(L,r,z,lvec,start,window)
+  m_E = 1 #M0=1 by def
+  m_L = 1
+  M_E = matrix(nrow=length(L),ncol=1) #by GREE
+  M_L = matrix(nrow=length(L),ncol=1) #by GREL
+  M_E[start]=1
+  M_L[start]=1
+  for (i in (start+1):length(L)) #since M0=1, start+1
+  { 
+    m_E_ = 1-lambda_GREE[i]+lambda_GREE[i]*e[i]
+    m_E = m_E*m_E_
+    M_E[i] = m_E
+    m_L = m_L*(1-lambda_GREL[i]+lambda_GREL[i]*e[i])
+    M_L[i,] = m_L
+  }
+  M_M = 0.5*M_E+0.5*M_L
+  return(list(M_GREE=M_E,
+              M_GREL=M_L,
+              M_GREM=M_M))
+}
+
+#==============================================================================#
+#                             E-backtesting portfolios                         #
+#==============================================================================#
+#=================================== naive ====================================#
+# load datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_portfolio.Rdata") 
+naive_return = -log(naive_portfolio$Value[-1]/naive_portfolio$Value[-4939])*100
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_n") #naive.n
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_t") #naive.t
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_skt") #naive.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/naive_emp") #naive.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/naiveLSTM") #naive.LSTM
+
+naive.n.t = M_l(naive_return[-(1:500)], #negated %
+              naive.n$ES_n,
+              naive.n$VaR_n,
+              0.975, 251, 250)
+naive.n.evt.t = M_l(naive_return[-(1:500)], #negated %
+                naive.n$ES_n.evt,
+                naive.n$VaR_n.evt,
+                0.975, 251, 250)
+naive.n.fhs.t = M_l(naive_return[-(1:500)], #negated %
+                naive.n$ES_n.fhs,
+                naive.n$VaR_n.fhs,
+                0.975, 251, 250)
+
+
+naive.t.t = M_l(naive_return[-(1:500)], #negated %
+                naive.t$ES_t,
+                naive.t$VaR_t,
+                0.975, 251, 250)
+naive.t.evt.t = M_l(naive_return[-(1:500)], #negated %
+                    naive.t$ES_t.evt,
+                    naive.t$VaR_t.evt,
+                    0.975, 251, 250)
+naive.t.fhs.t = M_l(naive_return[-(1:500)], #negated %
+                    naive.t$ES_t.fhs,
+                    naive.t$VaR_t.fhs,
+                    0.975, 251, 250)
+
+
+naive.skt.t = M_l(naive_return[-(1:500)], #negated %
+                naive.skt$ES_skt,
+                naive.skt$VaR_skt,
+                0.975, 251, 250)
+naive.skt.evt.t = M_l(naive_return[-(1:500)], #negated %
+                    naive.skt$ES_skt.evt,
+                    naive.skt$VaR_skt.evt,
+                    0.975, 251, 250)
+naive.skt.fhs.t = M_l(naive_return[-(1:500)], #negated %
+                    naive.skt$ES_skt.fhs,
+                    naive.skt$VaR_skt.fhs,
+                    0.975, 251, 250)
+
+
+naive.emp.t = M_l(naive_return[-(1:500)], #negated %
+                  naive.emp$ES_emp,
+                  naive.emp$VaR_emp,
+                  0.975, 251, 250)
+
+
+naive.lstm.t = M_l(naive_return[-(1:500)], #negated %
+                   -naive.LSTM$ES[-(1:250)], #negated for LSTM
+                   -naive.LSTM$VaR[-(1:250)],
+                   0.975, 251, 250)
+
+################################################################################
+plot(y=naive.lstm.t$M_GREM,ylim=c(0,11),x=min_ES$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="naive 1/N",lwd=1.5)
+lines(y=naive.n.t$M_GREM,x=min_ES$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=naive.n.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=naive.n.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=naive.t.t$M_GREM,x=min_ES$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=naive.t.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=naive.t.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=naive.skt.t$M_GREM,x=min_ES$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=naive.skt.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=naive.skt.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=naive.emp.t$M_GREM,x=min_ES$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+
+################################################################################
+#=================================  mv ========================================#
+# load datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_return.Rdata") #mv_return
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_n") #mv.n
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_t") #mv.t
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_skt") #mv.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/mv_emp") #mv.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/mvLSTM") #mv.LSTM
+
+mv.n.t = M_l(-mv_return$value[-(1:250)]*100,
+             mv.n$ES_n, mv.n$VaR_n, 0.975, 251, 250)
+mv.n.evt.t = M_l(-mv_return$value[-(1:250)]*100,
+                 mv.n$ES_n.evt, mv.n$VaR_n.evt, 0.975, 251, 250)
+mv.n.fhs.t = M_l(-mv_return$value[-(1:250)]*100,
+                 mv.n$ES_n.fhs, mv.n$VaR_n.fhs, 0.975, 251, 250)
+
+
+mv.t.t = M_l(-mv_return$value[-(1:250)]*100,
+             mv.t$ES_t, mv.t$VaR_t, 0.975, 251, 250)
+mv.t.evt.t = M_l(-mv_return$value[-(1:250)]*100,
+                 mv.t$ES_t.evt, mv.t$VaR_t.evt, 0.975, 251, 250)
+mv.t.fhs.t = M_l(-mv_return$value[-(1:250)]*100,
+                 mv.t$ES_t.fhs, mv.t$VaR_t.fhs, 0.975, 251, 250)
+
+
+mv.skt.t = M_l(-mv_return$value[-(1:250)]*100,
+               mv.skt$ES_skt, mv.skt$VaR_skt, 0.975, 251, 250)
+mv.skt.evt.t = M_l(-mv_return$value[-(1:250)]*100,
+                   mv.skt$ES_skt.evt, mv.skt$VaR_skt.evt, 0.975, 251, 250)
+mv.skt.fhs.t = M_l(-mv_return$value[-(1:250)]*100,
+                   mv.skt$ES_skt.fhs, mv.skt$VaR_skt.fhs, 0.975, 251, 250)
+
+
+mv.emp.t = M_l(-mv_return$value[-(1:250)]*100,
+               mv.emp$ES_emp, mv.emp$VaR_emp, 0.975, 251, 250)
+
+
+mv.lstm.t = M_l(-mv_return$value[-(1:250)]*100, 
+                -mv.LSTM$ES,
+                -mv.LSTM$VaR,
+                0.975, 251, 250)
+
+################################################################################
+plot(y=mv.lstm.t$M_GREM,ylim=c(0,11),x=min_ES$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="MV",lwd=1.5)
+lines(y=mv.n.t$M_GREM,x=min_ES$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=mv.n.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=mv.n.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=mv.t.t$M_GREM,x=min_ES$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=mv.t.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=mv.t.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=mv.skt.t$M_GREM,x=min_ES$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=mv.skt.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=mv.skt.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=mv.emp.t$M_GREM,x=min_ES$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+lines(y=mv.lstm.t$M_GREM,ylim=c(0,11),x=min_ES$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="MV",lwd=1.5)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+
+################################################################################
+#================================ min ES ======================================#
+# load datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/min_ES.Rdata") #min_ES
+load("C:/Users/1/OneDrive/桌面/portfolio/minES_n") #minES.n
+load("C:/Users/1/OneDrive/桌面/portfolio/minES_t") #minES.t
+load("C:/Users/1/OneDrive/桌面/portfolio/minES_skt") #minES.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/minES_emp") #minES.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/minESLSTM") #minES.LSTM
+
+minES.n.t = M_l(-min_ES$value[-(1:250)]*100,
+                minES.n$ES_n, minES.n$VaR_n, 0.975, 251, 250)
+minES.n.evt.t = M_l(-min_ES$value[-(1:250)]*100,
+                 minES.n$ES_n.evt, minES.n$VaR_n.evt, 0.975, 251, 250)
+minES.n.fhs.t = M_l(-min_ES$value[-(1:250)]*100,
+                 minES.n$ES_n.fhs, minES.n$VaR_n.fhs, 0.975, 251, 250)
+
+
+minES.t.t = M_l(-min_ES$value[-(1:250)]*100,
+                minES.t$ES_t, minES.t$VaR_t, 0.975, 251, 250)
+minES.t.evt.t = M_l(-min_ES$value[-(1:250)]*100,
+                 minES.t$ES_t.evt, minES.t$VaR_t.evt, 0.975, 251, 250)
+minES.t.fhs.t = M_l(-min_ES$value[-(1:250)]*100,
+                 minES.t$ES_t.fhs, minES.t$VaR_t.fhs, 0.975, 251, 250)
+
+
+minES.skt.t = M_l(-min_ES$value[-(1:250)]*100,
+                  minES.skt$ES_skt, minES.skt$VaR_skt, 0.975, 251, 250)
+minES.skt.evt.t = M_l(-min_ES$value[-(1:250)]*100,
+                   minES.skt$ES_skt.evt, minES.skt$VaR_skt.evt, 0.975, 251, 250)
+minES.skt.fhs.t = M_l(-min_ES$value[-(1:250)]*100,
+                   minES.skt$ES_skt.fhs, minES.skt$VaR_skt.fhs, 0.975, 251, 250)
+
+
+minES.emp.t = M_l(-min_ES$value[-(1:250)]*100,
+                  minES.emp$ES_emp, minES.emp$VaR_emp, 0.975, 251, 250)
+
+
+minES.lstm.t = M_l(-min_ES$value[-(1:250)]*100, 
+                   -minES.LSTM$ES*100,
+                   -minES.LSTM$VaR*100,
+                   0.975, 251, 250)
+
+################################################################################
+plot(y=minES.lstm.t$M_GREM,ylim=c(0,11),x=min_ES$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="min-ES",lwd=1.5)
+lines(y=minES.n.t$M_GREM,x=min_ES$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=minES.n.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=minES.n.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=minES.t.t$M_GREM,x=min_ES$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=minES.t.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=minES.t.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=minES.skt.t$M_GREM,x=min_ES$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=minES.skt.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=minES.skt.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=minES.emp.t$M_GREM,x=min_ES$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+
+################################################################################
+#================================= max R ======================================#
+# load datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/max_return.Rdata") #max_return
+load("C:/Users/1/OneDrive/桌面/portfolio/maxR_n") #maxR.n
+load("C:/Users/1/OneDrive/桌面/portfolio/maxR_t") #maxR.t
+load("C:/Users/1/OneDrive/桌面/portfolio/maxR_skt") #maxR.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/maxR_emp") #maxR.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/maxRLSTM") #maxR.LSTM
+
+maxR.n.t = M_l(-max_return$value[-(1:250)]*100,
+               maxR.n$ES_n, maxR.n$VaR_n, 0.975, 251, 250)
+maxR.n.evt.t = M_l(-max_return$value[-(1:250)]*100,
+                   maxR.n$ES_n.evt, maxR.n$VaR_n.evt, 0.975, 251, 250)
+maxR.n.fhs.t = M_l(-max_return$value[-(1:250)]*100,
+                    maxR.n$ES_n.fhs, maxR.n$VaR_n.fhs, 0.975, 251, 250)
+
+maxR.t.t = M_l(-max_return$value[-(1:250)]*100,
+               maxR.t$ES_t, maxR.t$VaR_t, 0.975, 251, 250)
+maxR.t.evt.t = M_l(-max_return$value[-(1:250)]*100,
+                   maxR.t$ES_t.evt, maxR.t$VaR_t.evt, 0.975, 251, 250)
+maxR.t.fhs.t = M_l(-max_return$value[-(1:250)]*100,
+                   maxR.t$ES_t.fhs, maxR.t$VaR_t.fhs, 0.975, 251, 250)
+
+
+maxR.skt.t = M_l(-max_return$value[-(1:250)]*100,
+                 maxR.skt$ES_skt, maxR.skt$VaR_skt, 0.975, 251, 250)
+maxR.skt.evt.t = M_l(-max_return$value[-(1:250)]*100,
+                     maxR.skt$ES_skt.evt, maxR.skt$VaR_skt.evt, 0.975, 251, 250)
+maxR.skt.fhs.t = M_l(-max_return$value[-(1:250)]*100,
+                     maxR.skt$ES_skt.fhs, maxR.skt$VaR_skt.fhs, 0.975, 251, 250)
+
+
+maxR.emp.t = M_l(-max_return$value[-(1:250)]*100,
+                 maxR.emp$ES_emp, maxR.emp$VaR_emp, 0.975, 251, 250)
+
+
+maxR.lstm.t = M_l(-max_return$value[-(1:250)]*100, 
+                   -maxR.LSTM$ES,
+                   -maxR.LSTM$VaR,
+                   0.975, 251, 250)
+
+################################################################################
+plot(y=maxR.lstm.t$M_GREM,ylim=c(0,11),x=min_ES$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="max-R",lwd=1.5)
+lines(y=maxR.n.t$M_GREM,x=min_ES$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=maxR.n.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=maxR.n.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=maxR.t.t$M_GREM,x=min_ES$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=maxR.t.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=maxR.t.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=maxR.skt.t$M_GREM,x=min_ES$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=maxR.skt.evt.t$M_GREM,x=min_ES$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=maxR.skt.fhs.t$M_GREM,x=min_ES$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=maxR.emp.t$M_GREM,x=min_ES$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+
+################################################################################
+#==============================================================================#
+#                           Produce the summary table                          #
+#==============================================================================#
+which(naive.n.t$M_GREM>2)[1]
+which(naive.n.evt.t$M_GREM>2)[1]
+which(naive.n.fhs.t$M_GREM>2)[1]
+which(naive.t.t$M_GREM>2)[1]
+which(naive.t.evt.t$M_GREM>2)[1]
+which(naive.t.fhs.t$M_GREM>2)[1]
+which(naive.skt.t$M_GREM>2)[1]
+which(naive.skt.evt.t$M_GREM>2)[1]
+which(naive.skt.fhs.t$M_GREM>2)[1]
+which(naive.emp.t$M_GREM>2)[1]
+which(naive.lstm.t$M_GREM>2)[1]
+mean(naive.n$ES_n);mean(naive.n$ES_n.evt);mean(naive.n$ES_n.fhs)
+mean(naive.t$ES_t);mean(naive.t$ES_t.evt);mean(naive.t$ES_t.fhs)
+mean(naive.skt$ES_skt);mean(naive.skt$ES_skt.evt);mean(naive.skt$ES_skt.fhs)
+mean(naive.LSTM$ES);mean(naive.emp$ES_emp)
+
+
+which(mv.n.t$M_GREM>2)[1]
+which(mv.n.evt.t$M_GREM>2)[1]
+which(mv.n.fhs.t$M_GREM>2)[1]
+which(mv.t.t$M_GREM>2)[1]
+which(mv.t.evt.t$M_GREM>2)[1]
+which(mv.t.fhs.t$M_GREM>2)[1]
+which(mv.skt.t$M_GREM>2)[1]
+which(mv.skt.evt.t$M_GREM>2)[1]
+which(mv.skt.fhs.t$M_GREM>2)[1]
+which(mv.emp.t$M_GREM>2)[1]
+which(mv.lstm.t$M_GREM>2)[1]
+mean(mv.n$ES_n);mean(mv.n$ES_n.evt);mean(mv.n$ES_n.fhs)
+mean(mv.t$ES_t);mean(mv.t$ES_t.evt);mean(mv.t$ES_t.fhs)
+mean(mv.skt$ES_skt);mean(mv.skt$ES_skt.evt);mean(mv.skt$ES_skt.fhs)
+mean(mv.LSTM$ES);mean(mv.emp$ES_emp)
+
+
+which(minES.n.t$M_GREM>2)[1]
+which(minES.n.evt.t$M_GREM>2)[1]
+which(minES.n.fhs.t$M_GREM>2)[1]
+which(minES.t.t$M_GREM>2)[1]
+which(minES.t.evt.t$M_GREM>2)[1]
+which(minES.t.fhs.t$M_GREM>2)[1]
+which(minES.skt.t$M_GREM>2)[1]
+which(minES.skt.evt.t$M_GREM>2)[1]
+which(minES.skt.fhs.t$M_GREM>2)[1]
+which(minES.emp.t$M_GREM>2)[1]
+which(minES.lstm.t$M_GREM>2)[1]
+mean(minES.n$ES_n);mean(minES.n$ES_n.evt);mean(minES.n$ES_n.fhs)
+mean(minES.t$ES_t);mean(minES.t$ES_t.evt);mean(minES.t$ES_t.fhs)
+mean(minES.skt$ES_skt);mean(minES.skt$ES_skt.evt);mean(minES.skt$ES_skt.fhs)
+mean(minES.LSTM$ES);mean(minES.emp$ES_emp)
+
+
+which(maxR.n.t$M_GREM>2)[1]
+which(maxR.n.evt.t$M_GREM>2)[1]
+which(maxR.n.fhs.t$M_GREM>2)[1]
+which(maxR.t.t$M_GREM>2)[1]
+which(maxR.t.evt.t$M_GREM>2)[1]
+which(maxR.t.fhs.t$M_GREM>2)[1]
+which(maxR.skt.t$M_GREM>2)[1]
+which(maxR.skt.evt.t$M_GREM>2)[1]
+which(maxR.skt.fhs.t$M_GREM>2)[1]
+which(maxR.emp.t$M_GREM>2)[1]
+which(maxR.lstm.t$M_GREM>2)[1]
+mean(maxR.n$ES_n);mean(maxR.n$ES_n.evt);mean(maxR.n$ES_n.fhs)
+mean(maxR.t$ES_t);mean(maxR.t$ES_t.evt);mean(maxR.t$ES_t.fhs)
+mean(maxR.skt$ES_skt);mean(maxR.skt$ES_skt.evt);mean(maxR.skt$ES_skt.fhs)
+mean(maxR.LSTM$ES);mean(maxR.emp$ES_emp)
+
+#==============================================================================#
+#                         E-backtesting return series                          #
+#==============================================================================#
+#================================= SSE ========================================#
+# load datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/SSE_return100.Rdata") #SSE.ret
+load("C:/Users/1/OneDrive/桌面/portfolio/SSE_n") #SSE.n
+load("C:/Users/1/OneDrive/桌面/portfolio/SSE_t") #SSE.t
+load("C:/Users/1/OneDrive/桌面/portfolio/SSE_skt") #SSE.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/SSE_emp") #SSE.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/SSELSTM") #SSE.LSTM
+
+SSE.n.t = M_l(-SSE.ret$return[-(1:250)],
+              SSE.n$ES_n,SSE.n$VaR_n,0.975, 251, 250)
+SSE.n.evt.t = M_l(-SSE.ret$return[-(1:250)],
+                  SSE.n$ES_n.evt,SSE.n$VaR_n.evt,0.975, 251, 250)
+SSE.n.fhs.t = M_l(-SSE.ret$return[-(1:250)],
+                  SSE.n$ES_n.fhs,SSE.n$VaR_n.fhs,0.975, 251, 250)
+
+SSE.t.t = M_l(-SSE.ret$return[-(1:250)],
+              SSE.t$ES_t,SSE.t$VaR_t,0.975, 251, 250)
+SSE.t.evt.t = M_l(-SSE.ret$return[-(1:250)],
+                  SSE.t$ES_t.evt,SSE.t$VaR_t.evt,0.975, 251, 250)
+SSE.t.fhs.t = M_l(-SSE.ret$return[-(1:250)],
+                  SSE.t$ES_t.fhs,SSE.t$VaR_t.fhs,0.975, 251, 250)
+
+SSE.skt.t = M_l(-SSE.ret$return[-(1:250)],
+                SSE.skt$ES_skt,SSE.skt$VaR_skt,0.975, 251, 250)
+SSE.skt.evt.t = M_l(-SSE.ret$return[-(1:250)],
+                    SSE.skt$ES_skt.evt,SSE.skt$VaR_skt.evt,0.975, 251, 250)
+SSE.skt.fhs.t = M_l(-SSE.ret$return[-(1:250)],
+                    SSE.skt$ES_skt.fhs,SSE.skt$VaR_skt.fhs,0.975, 251, 250)
+
+SSE.emp.t = M_l(-SSE.ret$return[-(1:250)],
+                SSE.emp$ES_emp,SSE.emp$VaR_emp,0.975, 251, 250)
+
+SSE.lstm.t = M_l(-SSE.ret$return[-(1:250)],
+                 -SSE.LSTM$ES,
+                 -SSE.LSTM$VaR,0.975, 251, 250)
+
+plot(y=SSE.lstm.t$M_GREM,ylim=c(0,11),x=SSE.ret$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="SSE",lwd=1.5)
+lines(y=SSE.n.t$M_GREM,x=SSE.ret$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=SSE.n.evt.t$M_GREM,x=SSE.ret$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=SSE.n.fhs.t$M_GREM,x=SSE.ret$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=SSE.t.t$M_GREM,x=SSE.ret$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=SSE.t.evt.t$M_GREM,x=SSE.ret$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=SSE.t.fhs.t$M_GREM,x=SSE.ret$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=SSE.skt.t$M_GREM,x=SSE.ret$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=SSE.skt.evt.t$M_GREM,x=SSE.ret$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=SSE.skt.fhs.t$M_GREM,x=SSE.ret$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=SSE.emp.t$M_GREM,x=SSE.ret$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+lines(y=SSE.lstm.t$M_GREM,ylim=c(0,11),x=SSE.ret$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="SSE",lwd=1.5)
+
+################################################################################
+#================================= AU99 =======================================#
+# load datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99_return100") #AU99.ret
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99_n") #AU99n
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99_t") #AU99.t
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99_skt") #AU99.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99_emp") #AU99.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/AU99LSTM") #AU99.LSTM
+
+
+AU99.n.t = M_l(-AU99.ret$return[-(1:250)],
+               AU99.n$ES_n,AU99.n$VaR_n,0.975, 251, 250)
+AU99.n.evt.t = M_l(-AU99.ret$return[-(1:250)],
+                  AU99.n$ES_n.evt,AU99.n$VaR_n.evt,0.975, 251, 250)
+AU99.n.fhs.t = M_l(-AU99.ret$return[-(1:250)],
+                  AU99.n$ES_n.fhs,AU99.n$VaR_n.fhs,0.975, 251, 250)
+
+AU99.t.t = M_l(-AU99.ret$return[-(1:250)],
+               AU99.t$ES_t,AU99.t$VaR_t,0.975, 251, 250)
+AU99.t.evt.t = M_l(-AU99.ret$return[-(1:250)],
+                   AU99.t$ES_t.evt,AU99.t$VaR_t.evt,0.975, 251, 250)
+AU99.t.fhs.t = M_l(-AU99.ret$return[-(1:250)],
+                   AU99.t$ES_t.fhs,AU99.t$VaR_t.fhs,0.975, 251, 250)
+
+AU99.skt.t = M_l(-AU99.ret$return[-(1:250)],
+                 AU99.skt$ES_skt,AU99.skt$VaR_skt,0.975, 251, 250)
+AU99.skt.evt.t = M_l(-AU99.ret$return[-(1:250)],
+                     AU99.skt$ES_skt.evt,AU99.skt$VaR_skt.evt,0.975, 251, 250)
+AU99.skt.fhs.t = M_l(-AU99.ret$return[-(1:250)],
+                    AU99.skt$ES_skt.fhs,AU99.skt$VaR_skt.fhs,0.975, 251, 250)
+
+AU99.emp.t = M_l(-AU99.ret$return[-(1:250)],
+                AU99.emp$ES_emp,AU99.emp$VaR_emp,0.975, 251, 250)
+
+AU99.lstm.t = M_l(-AU99.ret$return[-(1:250)],
+                 -AU99.LSTM$ES,
+                 -AU99.LSTM$VaR,0.975, 251, 250)
+
+plot(y=AU99.lstm.t$M_GREM,ylim=c(0,11),x=AU99.ret$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="AU99",lwd=1.5)
+lines(y=AU99.n.t$M_GREM,x=AU99.ret$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=AU99.n.evt.t$M_GREM,x=AU99.ret$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=AU99.n.fhs.t$M_GREM,x=AU99.ret$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=AU99.t.t$M_GREM,x=AU99.ret$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=AU99.t.evt.t$M_GREM,x=AU99.ret$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=AU99.t.fhs.t$M_GREM,x=AU99.ret$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=AU99.skt.t$M_GREM,x=AU99.ret$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=AU99.skt.evt.t$M_GREM,x=AU99.ret$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=AU99.skt.fhs.t$M_GREM,x=AU99.ret$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=AU99.emp.t$M_GREM,x=AU99.ret$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+
+################################################################################
+#================================= CBA ========================================#
+# load datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/CBA_return100.Rdata") #CBA.ret
+load("C:/Users/1/OneDrive/桌面/portfolio/CBA_n") #CBA.n
+load("C:/Users/1/OneDrive/桌面/portfolio/CBA_t") #CBA.t
+load("C:/Users/1/OneDrive/桌面/portfolio/CBA_skt") #CBA.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/CBA_emp") #CBA.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/CBALSTM") #CBA.LSTM
+
+CBA.n.t = M_l(-CBA.ret$return[-(1:250)],
+               CBA.n$ES_n,CBA.n$VaR_n,0.975, 251, 250)
+CBA.n.evt.t = M_l(-CBA.ret$return[-(1:250)],
+                   CBA.n$ES_n.evt,CBA.n$VaR_n.evt,0.975, 251, 250)
+CBA.n.fhs.t = M_l(-CBA.ret$return[-(1:250)],
+                   CBA.n$ES_n.fhs,CBA.n$VaR_n.fhs,0.975, 251, 250)
+
+CBA.t.t = M_l(-CBA.ret$return[-(1:250)],
+               CBA.t$ES_t,CBA.t$VaR_t,0.975, 251, 250)
+CBA.t.evt.t = M_l(-CBA.ret$return[-(1:250)],
+                   CBA.t$ES_t.evt,CBA.t$VaR_t.evt,0.975, 251, 250)
+CBA.t.fhs.t = M_l(-CBA.ret$return[-(1:250)],
+                   CBA.t$ES_t.fhs,CBA.t$VaR_t.fhs,0.975, 251, 250)
+
+CBA.skt.t = M_l(-CBA.ret$return[-(1:250)],
+                 CBA.skt$ES_skt,CBA.skt$VaR_skt,0.975, 251, 250)
+CBA.skt.evt.t = M_l(-CBA.ret$return[-(1:250)],
+                     CBA.skt$ES_skt.evt,CBA.skt$VaR_skt.evt,0.975, 251, 250)
+CBA.skt.fhs.t = M_l(-CBA.ret$return[-(1:250)],
+                     CBA.skt$ES_skt.fhs,CBA.skt$VaR_skt.fhs,0.975, 251, 250)
+
+CBA.emp.t = M_l(-CBA.ret$return[-(1:250)],
+                 CBA.emp$ES_emp,CBA.emp$VaR_emp,0.975, 251, 250)
+
+CBA.lstm.t = M_l(-CBA.ret$return[-(1:250)],
+                  -CBA.LSTM$ES,
+                  -CBA.LSTM$VaR,0.975, 251, 250)
+
+plot(y=CBA.lstm.t$M_GREM,ylim=c(0,11),x=CBA.ret$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="CBA",lwd=1.5)
+lines(y=CBA.n.t$M_GREM,x=CBA.ret$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=CBA.n.evt.t$M_GREM,x=CBA.ret$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=CBA.n.fhs.t$M_GREM,x=CBA.ret$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=CBA.t.t$M_GREM,x=CBA.ret$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=CBA.t.evt.t$M_GREM,x=CBA.ret$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=CBA.t.fhs.t$M_GREM,x=CBA.ret$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=CBA.skt.t$M_GREM,x=CBA.ret$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=CBA.skt.evt.t$M_GREM,x=CBA.ret$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=CBA.skt.fhs.t$M_GREM,x=CBA.ret$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=CBA.emp.t$M_GREM,x=CBA.ret$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+legend("topleft",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+
+################################################################################
+#================================= RMB ========================================#
+# laod datasets
+load("C:/Users/1/OneDrive/桌面/portfolio/RMBUSD_return100.Rdata") #RMBUSD.ret
+load("C:/Users/1/OneDrive/桌面/portfolio/RMB_n") #RMB.n
+load("C:/Users/1/OneDrive/桌面/portfolio/RMB_t") #RMB.t
+load("C:/Users/1/OneDrive/桌面/portfolio/RMB_skt") #RMB.skt
+load("C:/Users/1/OneDrive/桌面/portfolio/RMB_emp") #RMB.emp
+load("C:/Users/1/OneDrive/桌面/portfolio/RMBLSTM") #RMBUSD.LSTM
+
+#------------------------------------------------------------------------------#
+# Before doing backtest, need to correct the case in LSTM: 
+# when VaR>0, set VaR=0 and ES = empirical to avoid NaN in e-value.
+# Also need to correct the case in GARCH-EVT-skt: 
+# when VaR>0, set VaR=0 and ES = empirical to avoid NaN in e-value.
+
+RMBUSD.LSTM$ES[which(RMBUSD.LSTM$VaR==0)] = -RMB.emp$ES_emp[which(RMBUSD.LSTM$VaR==0)]
+
+RMB.skt$ES_skt.evt[which(RMB.skt$ES_skt.evt==RMB.skt$VaR_skt.evt)]=
+  RMB.emp$ES_emp[which(RMB.skt$ES_skt.evt==RMB.skt$VaR_skt.evt)]
+
+RMB.t$ES_t.evt[which(RMB.t$ES_t.evt==RMB.t$VaR_t.evt)]=
+  RMB.emp$ES_emp[which(RMB.t$ES_t.evt==RMB.t$VaR_t.evt)];
+RMB.t$VaR_t.evt[which(RMB.t$ES_t.evt==RMB.t$VaR_t.evt)]=
+  RMB.emp$VaR_emp[which(RMB.t$ES_t.evt==RMB.t$VaR_t.evt)]
+
+#------------------------------------------------------------------------------#
+# Now start e-backtesting:
+
+RMB.n.t = M_l(-RMBUSD.ret$return[-(1:250)],
+              RMB.n$ES_n,RMB.n$VaR_n,0.975, 251, 250)
+RMB.n.evt.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                  RMB.n$ES_n.evt,RMB.n$VaR_n.evt,0.975, 251, 250)
+RMB.n.fhs.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                  RMB.n$ES_n.fhs,RMB.n$VaR_n.fhs,0.975, 251, 250)
+
+RMB.t.t = M_l(-RMBUSD.ret$return[-(1:250)],
+              RMB.t$ES_t,RMB.t$VaR_t,0.975, 251, 250)
+RMB.t.evt.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                  RMB.t$ES_t.evt,RMB.t$VaR_t.evt,0.975, 251, 250)
+RMB.t.fhs.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                  RMB.t$ES_t.fhs,RMB.t$VaR_t.fhs,0.975, 251, 250)
+
+RMB.skt.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                RMB.skt$ES_skt,RMB.skt$VaR_skt,0.975, 251, 250)
+RMB.skt.evt.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                    RMB.skt$ES_skt.evt,RMB.skt$VaR_skt.evt,0.975, 251, 250)
+RMB.skt.fhs.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                    RMB.skt$ES_skt.fhs,RMB.skt$VaR_skt.fhs,0.975, 251, 250)
+
+RMB.emp.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                RMB.emp$ES_emp,RMB.emp$VaR_emp,0.975, 251, 250)
+
+RMB.lstm.t = M_l(-RMBUSD.ret$return[-(1:250)],
+                 -RMBUSD.LSTM$ES,
+                 -RMBUSD.LSTM$VaR,0.975, 251, 250)
+
+plot(y=RMB.lstm.t$M_GREM,ylim=c(0,11),x=RMBUSD.ret$date[-(1:250)],
+     type="l",xlab="Time",ylab="realized e-value",
+     main="RMB/USD",lwd=1.5)
+lines(y=RMB.n.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="lightblue2",lwd=1.2)
+lines(y=RMB.n.evt.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="olivedrab",lwd=1.2)
+lines(y=RMB.n.fhs.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="palevioletred",lwd=1.2)
+lines(y=RMB.t.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="royalblue2",lwd=1.2)
+lines(y=RMB.t.evt.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="darkorange3",lwd=1.2)
+lines(y=RMB.t.fhs.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="#F0E68C",lwd=1.2)
+lines(y=RMB.skt.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="#227252",lwd=1.2)
+lines(y=RMB.skt.evt.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="#B4AB2f",lwd=1.2)
+lines(y=RMB.skt.fhs.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="darkseagreen3",lwd=1.2)
+lines(y=RMB.emp.t$M_GREM,x=RMBUSD.ret$date[-(1:250)],col="#CB125E",lwd=1.2)
+abline(h=2,lty=2)
+legend("topright",
+       legend = c("LSTM-AL","GARCH-n","EVT-n","FHS-n","GARCH-t","EVT-t","FHS-t",
+                  "GARCH-skt","EVT-skt","FHS-skt","emp"),
+       lty = rep(1,11),
+       lwd = rep(2,11),
+       col = c("black","lightblue2","olivedrab","palevioletred",
+               'royalblue2', "darkorange3","#F0E68C",
+               "#227252","#B4AB2f","darkseagreen3","#CB126E"),
+       cex = 0.4,text.width = 250)
+
+################################################################################
+#==============================================================================#
+#                           Produce the summary table                          #
+#==============================================================================#
+which(SSE.n.t$M_GREM>2)[1]
+which(SSE.n.evt.t$M_GREM>2)[1]
+which(SSE.n.fhs.t$M_GREM>2)[1]
+which(SSE.t.t$M_GREM>2)[1]
+which(SSE.t.evt.t$M_GREM>2)[1]
+which(SSE.t.fhs.t$M_GREM>2)[1]
+which(SSE.skt.t$M_GREM>2)[1]
+which(SSE.skt.evt.t$M_GREM>2)[1]
+which(SSE.skt.fhs.t$M_GREM>2)[1]
+which(SSE.emp.t$M_GREM>2)[1]
+which(SSE.lstm.t$M_GREM>2)[1]
+mean(SSE.n$ES_n);mean(SSE.n$ES_n.evt);mean(SSE.n$ES_n.fhs)
+mean(SSE.t$ES_t);mean(SSE.t$ES_t.evt);mean(SSE.t$ES_t.fhs)
+mean(SSE.skt$ES_skt);mean(SSE.skt$ES_skt.evt);mean(SSE.skt$ES_skt.fhs)
+mean(SSE.LSTM$ES);mean(SSE.emp$ES_emp)
+
+
+which(AU99.n.t$M_GREM>2)[1]
+which(AU99.n.evt.t$M_GREM>2)[1]
+which(AU99.n.fhs.t$M_GREM>2)[1]
+which(AU99.t.t$M_GREM>2)[1]
+which(AU99.t.evt.t$M_GREM>2)[1]
+which(AU99.t.fhs.t$M_GREM>2)[1]
+which(AU99.skt.t$M_GREM>2)[1]
+which(AU99.skt.evt.t$M_GREM>2)[1]
+which(AU99.skt.fhs.t$M_GREM>2)[1]
+which(AU99.emp.t$M_GREM>2)[1]
+which(AU99.lstm.t$M_GREM>2)[1]
+mean(AU99.n$ES_n);mean(AU99.n$ES_n.evt);mean(AU99.n$ES_n.fhs)
+mean(AU99.t$ES_t);mean(AU99.t$ES_t.evt);mean(AU99.t$ES_t.fhs)
+mean(AU99.skt$ES_skt);mean(AU99.skt$ES_skt.evt);mean(AU99.skt$ES_skt.fhs)
+mean(AU99.LSTM$ES);mean(AU99.emp$ES_emp)
+
+
+which(CBA.n.t$M_GREM>2)[1]
+which(CBA.n.evt.t$M_GREM>2)[1]
+which(CBA.n.fhs.t$M_GREM>2)[1]
+which(CBA.t.t$M_GREM>2)[1]
+which(CBA.t.evt.t$M_GREM>2)[1]
+which(CBA.t.fhs.t$M_GREM>2)[1]
+which(CBA.skt.t$M_GREM>2)[1]
+which(CBA.skt.evt.t$M_GREM>2)[1]
+which(CBA.skt.fhs.t$M_GREM>2)[1]
+which(CBA.emp.t$M_GREM>2)[1]
+which(CBA.lstm.t$M_GREM>2)[1]
+mean(CBA.n$ES_n);mean(CBA.n$ES_n.evt);mean(CBA.n$ES_n.fhs)
+mean(CBA.t$ES_t);mean(CBA.t$ES_t.evt);mean(CBA.t$ES_t.fhs)
+mean(CBA.skt$ES_skt);mean(CBA.skt$ES_skt.evt);mean(CBA.skt$ES_skt.fhs)
+mean(CBA.LSTM$ES);mean(CBA.emp$ES_emp)
+
+
+which(RMB.n.t$M_GREM>2)[1]
+which(RMB.n.evt.t$M_GREM>2)[1]
+which(RMB.n.fhs.t$M_GREM>2)[1]
+which(RMB.t.t$M_GREM>2)[1]
+which(RMB.t.evt.t$M_GREM>2)[1]
+which(RMB.t.fhs.t$M_GREM>2)[1]
+which(RMB.skt.t$M_GREM>2)[1]
+which(RMB.skt.evt.t$M_GREM>2)[1]
+which(RMB.skt.fhs.t$M_GREM>2)[1]
+which(RMB.emp.t$M_GREM>2)[1]
+which(RMB.lstm.t$M_GREM>2)[1]
+mean(RMB.n$ES_n);mean(RMB.n$ES_n.evt);mean(RMB.n$ES_n.fhs)
+mean(RMB.t$ES_t);mean(RMB.t$ES_t.evt);mean(RMB.t$ES_t.fhs)
+mean(RMB.skt$ES_skt);mean(RMB.skt$ES_skt.evt);mean(RMB.skt$ES_skt.fhs)
+mean(RMBUSD.LSTM$ES);mean(RMB.emp$ES_emp)
+
+#==============================================================================#
+#                                  Re-e-backtest                               #
+#                                                                              #
+# Here I re-ebacktest 3 methods at every 1,000 days to give a more general view: 
+# 1. LSTM-AL model (on SSE and MV datasets);                                   #
+# 2. GARCH-EVT with t innovation (on SSE dataset);                             #
+# 3. GARCH with skewed-t innovation (on RMB/USD dataset)                       #
+#==============================================================================#
+
+multiple_test <- function(realized,ES,VaR,start,window) {
+  s = seq(from=start,to=length(realized),by=1000)
+  retest = NULL
+  for (i in s) {
+    test = M_l(realized, ES, VaR, 0.975, i, window)
+    retest = cbind(retest,test$M_GREM)
+  }
+  return(retest)
+}
+
+
+lstm.sse.retest = multiple_test(-SSE.ret$return[-(1:250)],
+                                -SSE.LSTM$ES,
+                                -SSE.LSTM$VaR, 251, 250)
+
+plot(y=lstm.sse.retest[,1],type="l",ylim=c(0,11),x=SSE.ret$date[-(1:250)],
+     lwd=1.5,xlab="Time", ylab="realized e-value")
+lines(y=lstm.sse.retest[,2],x=SSE.ret$date[-(1:250)],
+      lwd=2,col='#D7A3AC')
+lines(y=lstm.sse.retest[,3],x=SSE.ret$date[-(1:250)],
+      lwd=2,col="palevioletred")
+lines(y=lstm.sse.retest[,4],x=SSE.ret$date[-(1:250)],
+      lwd=2,col="palegreen4")
+lines(y=lstm.sse.retest[,5],x=SSE.ret$date[-(1:250)],
+      lwd=2,col="#B4AB2f")
+abline(h=2,lty=2)
+
+
+lstm.mv.retest = multiple_test(-mv_return$value[-(1:250)]*100, 
+                               -mv.LSTM$ES,
+                               -mv.LSTM$VaR, 251, 250)
+
+plot(y=lstm.mv.retest[,1],type="l",ylim=c(0,11),
+     x=mv_return$date[-(1:250)],
+     lwd=1.5,xlab="Time", ylab="realized e-value")
+lines(y=lstm.mv.retest[,2],x=mv_return$date[-(1:250)],lwd=2,col='#D7A3AC')
+lines(y=lstm.mv.retest[,3],x=mv_return$date[-(1:250)],lwd=2,col="palevioletred")
+lines(y=lstm.mv.retest[,4],x=mv_return$date[-(1:250)],lwd=2,col="palegreen4")
+lines(y=lstm.mv.retest[,5],x=mv_return$date[-(1:250)],lwd=2,col="#B4AB2f")
+abline(h=2,lty=2)
+
+
+Gskt.rmb.retest = multiple_test(-RMBUSD.ret$return[-(1:250)],
+                                RMB.skt$ES_skt,RMB.skt$VaR_skt, 251, 250)
+
+plot(y=Gskt.rmb.retest[,1],type="l",ylim=c(0,11),
+     x=RMBUSD.ret$date[-(1:250)],
+     lwd=1.5,xlab="Time", ylab="realized e-value")
+lines(y=Gskt.rmb.retest[,2],x=RMBUSD.ret$date[-(1:250)],lwd=2,col='#D7A3AC')
+lines(y=Gskt.rmb.retest[,3],x=RMBUSD.ret$date[-(1:250)],lwd=2,col="palevioletred")
+lines(y=Gskt.rmb.retest[,4],x=RMBUSD.ret$date[-(1:250)],lwd=2,col="palegreen4")
+lines(y=Gskt.rmb.retest[,5],x=RMBUSD.ret$date[-(1:250)],lwd=2,col="#B4AB2f")
+abline(h=2,lty=2)
+
+
+Gt.sse.retest = multiple_test(-SSE.ret$return[-(1:250)],
+                              SSE.t$ES_t.evt,SSE.t$VaR_t.evt, 251, 250)
+
+plot(y=Gt.sse.retest[,1],type="l",ylim=c(0,11),
+     x=SSE.ret$date[-(1:250)],
+     lwd=1.5,xlab="Time", ylab="realized e-value")
+lines(y=Gt.sse.retest[,2],x=SSE.ret$date[-(1:250)],lwd=2,col='#D7A3AC')
+lines(y=Gt.sse.retest[,3],x=SSE.ret$date[-(1:250)],lwd=2,col="palevioletred")
+lines(y=Gt.sse.retest[,4],x=SSE.ret$date[-(1:250)],lwd=2,col="palegreen4")
+lines(y=Gt.sse.retest[,5],x=SSE.ret$date[-(1:250)],lwd=2,col="#B4AB2f")
+abline(h=2,lty=2)
+
+################################################################################
+#==============================================================================#
+#                            Check the breach date                             #
+#==============================================================================#
+SSE.ret$date[(which(as.vector(Gt.sse.retest[,1])>=2)[1]+250)]
+SSE.ret$date[(which(as.vector(Gt.sse.retest[,2])>=2)[1]+250)]
+SSE.ret$date[(which(as.vector(Gt.sse.retest[,3])>=2)[1]+250)]
+SSE.ret$date[(which(as.vector(Gt.sse.retest[,4])>=2)[1]+250)]
+SSE.ret$date[(which(as.vector(Gt.sse.retest[,5])>=2)[1]+250)]
+
+RMBUSD.ret$date[(which(as.vector(Gskt.rmb.retest[,1])>=2)[1]+250)]
+RMBUSD.ret$date[(which(as.vector(Gskt.rmb.retest[,2])>=2)[1]+250)]
+RMBUSD.ret$date[(which(as.vector(Gskt.rmb.retest[,3])>=2)[1]+250)]
+RMBUSD.ret$date[(which(as.vector(Gskt.rmb.retest[,4])>=2)[1]+250)]
+RMBUSD.ret$date[(which(as.vector(Gskt.rmb.retest[,5])>=2)[1]+250)]
