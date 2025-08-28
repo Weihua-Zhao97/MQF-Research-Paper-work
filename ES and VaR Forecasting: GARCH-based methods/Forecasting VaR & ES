@@ -6,13 +6,13 @@
 # Assume the return {Xt} is an AR(1)-GARCH(1,1) process with innovations {Zt}  #
 # coming from normal, student t, and skewed-t distributions, and use GARCH,    #
 # GARCH-EVT, and GARCH-FHS to forecast VaR and ES respectively.                #
-# Also, the empirical method is included as the end. A 250-day moving window   #
+# Also, the empirical method is included at the end. A 250-day moving window   #
 # is applied to all methods.                                                   #
 #                                                                              #
 # Input: use negated percentage log returns                                    #
 #                                                                              #
 # 1. GARCH model:                                                              #
-# The sequence of returns is modeled as an AR(1)-GARCH(1,1) process.           #
+#    The sequence of returns is modeled as an AR(1)-GARCH(1,1) process.        #
 #                                                                              #
 # 2. GARCH-EVT:                                                                #
 #    This method is proposed in McNeil and Frey (2000), which softens impact   # 
